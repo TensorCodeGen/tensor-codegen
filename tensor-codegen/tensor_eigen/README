@@ -1,0 +1,5 @@
+To run the benchmark:
+make run
+
+The number of threads can be specified with $THREADS:
+THREADS=8 make run
