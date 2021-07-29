@@ -503,8 +503,8 @@ bool TensorInfoWrapperPass::runOnFunction(Function &F) {
 
 char TensorInfoWrapperPass::ID = 0;
 
- TensorInfoWrapperPass::TensorInfoWrapperPass() : FunctionPass(ID) {
-   initializeTensorInfoWrapperPassPass(*PassRegistry::getPassRegistry());
+TensorInfoWrapperPass::TensorInfoWrapperPass() : FunctionPass(ID) {
+     initializeTensorInfoWrapperPassPass(*PassRegistry::getPassRegistry());
 }
 
  INITIALIZE_PASS(TensorInfoWrapperPass, "tensor-analysis", "Pass to inferring tensor properties",

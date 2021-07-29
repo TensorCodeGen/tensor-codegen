@@ -17,6 +17,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/LLVMContext.h"
 
+#define DEBUG_TYPE "TensorType"
+
 namespace llvm {
 
 // Pseudo Tensor Type in LLVM
