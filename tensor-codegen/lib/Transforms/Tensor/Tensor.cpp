@@ -765,6 +765,20 @@ bool TensorPass::runOnFunction(Function &F) {
         bool Mapped = mapTensorValToProperty(Inst, ValToPropertyMap, TensorWaitlist);
         errs() << "MAPPED: " << Mapped << "\n";
         if (auto *CI = dyn_cast<CallInst>(Inst)) {
+          
+          CallInst* TypeInfoCI = dyn_cast<CallInst>(CI->getArgOperand(0)); 
+          // In case a new vector PHI for typeinfo was
+          // inserted, not previously visited in RPOT
+          if(Mapped && TypeInfoCI && find(CallInstVect,TypeInfoCI) == CallInstVect.end()){
+              Function* CF = TypeInfoCI->getCalledFunction();
+              if(CF && CF->getName().contains(StringRef("tensor_typeinfo"))) {
+                  errs()<<" NEW CALL INSTRUCTION (PHI) Created\n";
+                  errs()<<*TypeInfoCI<<"\n";
+                  CallInstVect.push_back(TypeInfoCI);
+
+                } 
+          }
+
           errs() << "CALL INSTRUCTION FOUND\n";
           errs() << CI->getCalledFunction()->getName() << "\n";
           errs() << "CALL INSTRUCTION FOUND: " << *CI << "\n";

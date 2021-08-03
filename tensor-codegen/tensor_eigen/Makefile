@@ -7,7 +7,7 @@ BENCH_BIN = $(BUILD)/tensor_eigen/matmul_bench
 
 $(BENCH_BIN): matmul_bench.cpp
 	mkdir $(BUILD)/tensor_eigen -p
-	clang++ $(OPTS) matmul_bench.cpp -o $(BUILD)/tensor_eigen/matmul_bench
+	$(BIN)/clang++ $(OPTS) matmul_bench.cpp -o $(BUILD)/tensor_eigen/matmul_bench
 
 run: $(BENCH_BIN)
 	$(BENCH_BIN) $(THREADS)
