@@ -2143,6 +2143,7 @@ bool LowerTensorIntrinsicsLegacyPass::runOnFunction(Function &F) {
 
   // Remove the typeinfo intrinsics
   for (auto *II : ToBeRemoved) {
+    II->replaceAllUsesWith(UndefValue::get(II->getType()));
     II->eraseFromParent();
   }
 
