@@ -5,7 +5,7 @@ BUILD=$(LLVM_ROOT)/build
 
 TESTS=$(SOURCES:%.c)
 
-all: licm dse cse dce adce loop_dist
+all: licm dse cse dce adce
 
 licm:
 	$(BIN)/clang -S -emit-llvm licm_test.c -O0 -Xclang -disable-O0-optnone
