@@ -1704,6 +1704,21 @@ def int_tensor_broadcast : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, LLVMVe
 def int_tensor_transpose : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty],
                                         [IntrNoMem, IntrSpeculatable]>;
 
+
+//===---------- Intrinsics to represent vector operations -----------------===//
+
+def int_vector_splat : Intrinsic<[llvm_anyvector_ty], [llvm_anyvector_ty, LLVMVectorElementType<0>],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
+def int_vector_reduce_mac_acc : Intrinsic<[llvm_anyvector_ty], [llvm_anyvector_ty, llvm_anyvector_ty,
+                                                            llvm_anyvector_ty, llvm_anyint_ty],
+                                                            [IntrNoMem, IntrSpeculatable]>;
+
+def int_vector_reduce_mac : Intrinsic<[llvm_anyvector_ty], [llvm_anyvector_ty, llvm_anyvector_ty,
+                                                            llvm_anyint_ty],
+                                                            [IntrNoMem, IntrSpeculatable]>;
+
+
 //===----------------------------------------------------------------------===//
 // Target-specific intrinsics
 //===----------------------------------------------------------------------===//
