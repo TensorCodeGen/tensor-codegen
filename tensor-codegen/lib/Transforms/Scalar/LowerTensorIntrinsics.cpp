@@ -51,6 +51,11 @@ static cl::opt<std::string> ReadKnobsFrom(
     "read-knobs-from", cl::desc("If set, read knob values from the given file "
                                 "and lower instructions with these values"));
 
+
+static cl::opt<bool> LowerToVectorIntrinsics(
+    "use-vector-intrinsics", cl::desc("If set, lower tensor operations to vector"
+                                      "intrinsics"));
+
 unsigned TileSize_M = 2;
 unsigned TileSize_N = 2;
 unsigned TileSize_K = 2;
@@ -1098,6 +1103,15 @@ public:
     return BinaryOperator::Create(Instruction::Add, Sum, Mul, "", InsertBefore);
   }
 
+  Value *createReduceMacIntrinsic(
+            Value *A, Value *B, unsigned BlockSize, Instruction *InsertBefore) {
+    auto *MacIntrinsic = Intrinsic::getDeclaration(InsertBefore->getModule(), 
+                      Intrinsic::vector_reduce_mac, ArrayRef<Type*>({A->getType()}));
+    auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
+    std::vector<Value *> Args = {A, B, ConstantInt::get(Int32Ty, BlockSize)};
+    return CallInst::Create(MacIntrinsic, Args, "", InsertBefore);
+  }
+
   Value *
   reduceVector(Value *Vect, unsigned NumElems, Instruction *InsertBefore) {
     auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
@@ -1137,6 +1151,162 @@ public:
       Result[I] = InsertElementInst::Create(
           Result[I], V, ConstantInt::get(I32Ty, J), "insert.elem",
           InsertBefore);
+    }
+  }
+
+
+  void generateMatrixMultiplyKernel_1D(
+      MatMulInfo &MMInfo, Type *EltType, Instruction *InsertBefore) {
+    const unsigned VF = std::max<unsigned>(
+        TTI.getRegisterBitWidth(true) /
+            EltType->getPrimitiveSizeInBits().getFixedSize(),
+        1U);
+
+    TensorType &LTileTensorType = MMInfo.LTile;
+    TensorType &RTileTensorType = MMInfo.RTile;
+    unsigned R = MMInfo.LTileDim;
+    unsigned C = MMInfo.RTileDim;
+    unsigned M = MMInfo.TileCommonDim;
+
+    SmallVector<Value *, 16> &A = MMInfo.LTileVector;
+    SmallVector<Value *, 16> &B = MMInfo.RTileVector;
+    SmallVector<Value *, 16> &TileResult = MMInfo.OutTileVector;
+
+    auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
+    bool IsFP = EltType->isFloatingPointTy();
+
+    if (MMInfo.isRowMajor(LTileTensorType) &&
+        MMInfo.isColumnMajor(RTileTensorType)) {
+      for (unsigned I = 0; I < R; I++) {
+        bool isSumZero = isa<ConstantAggregateZero>(TileResult[I]);
+        SmallVector<Value *, 16> ResultElemVect;
+        for (unsigned J = 0; J < C; J++) {
+          Value *Sum = nullptr;
+          unsigned BlockSize = VF;
+          for (unsigned K = 0; K < M; K += BlockSize) {
+            // Gradually lower the vectorization factor to cover the remainder.
+            while (K + BlockSize > M) {
+              BlockSize /= 2;
+            }
+
+            auto *L = extractVector(
+                MMInfo, LTileTensorType, A, I, K, BlockSize, InsertBefore);
+            auto *R = extractVector(
+                MMInfo, RTileTensorType, B, K, J, BlockSize, InsertBefore);
+            auto *NewSum = createReduceMacIntrinsic(L, R, BlockSize, InsertBefore);
+            if(Sum) {
+              if(IsFP) {
+                Sum = BinaryOperator::Create(
+                        Instruction::FAdd, NewSum, Sum, "reduce.add", InsertBefore);
+              } else {
+                Sum = BinaryOperator::Create(
+                        Instruction::Add, NewSum, Sum, "reduce.add", InsertBefore);
+              }
+            } else {
+              Sum = NewSum;
+            }
+          }
+          ResultElemVect.push_back(Sum);
+        }
+
+        auto *Vect = assembleVector(EltType, ResultElemVect, InsertBefore);
+        TileResult[I] = accumulateResult(TileResult[I], Vect, InsertBefore);
+      }
+      return;
+    }
+
+    if (MMInfo.isColumnMajor(LTileTensorType) &&
+        MMInfo.isRowMajor(RTileTensorType)) {
+      unsigned BlockSize = VF;
+      for (unsigned I = 0; I < R; I++) {
+        bool isSumZero = isa<ConstantAggregateZero>(TileResult[I]);
+        for (unsigned J = 0; J < C; J += BlockSize) {
+          while (J + BlockSize > C) {
+            BlockSize /= 2;
+          }
+
+          Value *Sum = nullptr;
+          for (unsigned K = 0; K < M; ++K) {
+            auto *R = extractVector(
+                MMInfo, RTileTensorType, B, K, J, BlockSize, InsertBefore);
+            auto *LH = ExtractElementInst::Create(
+                A[K], ConstantInt::get(Int32Ty, I), "", InsertBefore);
+            auto *Splat = createBroadCastIntrinsic(LH, BlockSize, InsertBefore);
+            Sum = createMulAdd(
+                isSumZero && K == 0 ? nullptr : Sum, Splat, R, IsFP,
+                InsertBefore);
+          }
+          auto *Vector = insertVector(TileResult[I], J, Sum, InsertBefore);
+          TileResult[I] = accumulateResult(TileResult[I], Vector, InsertBefore);
+        }
+      }
+      return;
+    }
+
+    if (MMInfo.isColumnMajor(LTileTensorType) &&
+        MMInfo.isColumnMajor(RTileTensorType)) {
+      unsigned BlockSize = VF;
+      for (unsigned I = 0; I < R; I += BlockSize) {
+        while (I + BlockSize > R) {
+          BlockSize /= 2;
+        }
+        bool isSumZero = dyn_cast<ConstantAggregateZero>(TileResult[I]);
+
+        // Fill a pseudo-tile with undefined
+        SmallVector<Value *, 16> ResultVect;
+        for (unsigned J = 0; J < R; J++) {
+          ResultVect.push_back(UndefValue::get(TileResult[0]->getType()));
+        }
+        for (unsigned J = 0; J < C; J++) {
+          Value *Sum = nullptr;
+          for (unsigned K = 0; K < M; ++K) {
+            auto *L = extractVector(
+                MMInfo, LTileTensorType, A, I, K, BlockSize, InsertBefore);
+            auto *RH = ExtractElementInst::Create(
+                B[J], ConstantInt::get(Int32Ty, K), "", InsertBefore);
+            auto *Splat = createBroadCastIntrinsic(RH, BlockSize, InsertBefore);
+            Sum = createMulAdd(
+                isSumZero && K == 0 ? nullptr : Sum, L, Splat, IsFP,
+                InsertBefore);
+          }
+          splitVector(Sum, ResultVect, J, InsertBefore);
+        }
+
+        for (unsigned J = 0; J < R; J++) {
+          auto *Vector =
+              insertVector(TileResult[J], I, ResultVect[J], InsertBefore);
+          TileResult[J] = accumulateResult(TileResult[J], Vector, InsertBefore);
+        }
+      }
+      return;
+    }
+
+    if (MMInfo.isRowMajor(LTileTensorType) &&
+        MMInfo.isRowMajor(RTileTensorType)) {
+      for (unsigned I = 0; I < R; ++I) {
+        unsigned BlockSize = VF;
+        bool isSumZero = isa<ConstantAggregateZero>(TileResult[I]);
+
+        for (unsigned J = 0; J < C; J += BlockSize) {
+          while (J + BlockSize > C) {
+            BlockSize /= 2;
+          }
+          Value *Sum = nullptr;
+          for (unsigned K = 0; K < M; ++K) {
+            auto *R = extractVector(
+                MMInfo, RTileTensorType, B, K, J, BlockSize, InsertBefore);
+            auto *LH = ExtractElementInst::Create(
+                A[I], ConstantInt::get(Int32Ty, K), "", InsertBefore);
+            auto *Splat = createBroadCastIntrinsic(LH, BlockSize, InsertBefore);
+            Sum = createMulAdd(
+                isSumZero && K == 0 ? nullptr : Sum, Splat, R, IsFP,
+                InsertBefore);
+          }
+          auto *Vector = insertVector(TileResult[I], J, Sum, InsertBefore);
+          TileResult[I] = accumulateResult(TileResult[I], Vector, InsertBefore);
+        }
+      }
+      return;
     }
   }
 
@@ -1365,7 +1535,10 @@ public:
     LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
 
     // Generate the matmul kernel
-    generateMatrixMultiplyKernel(MMInfo, EltType, InnerBodyTerminator);
+    if(LowerToVectorIntrinsics)
+      generateMatrixMultiplyKernel_1D(MMInfo, EltType, InnerBodyTerminator);
+    else
+      generateMatrixMultiplyKernel(MMInfo, EltType, InnerBodyTerminator);
 
     LLVM_DEBUG(dbgs() << "GENERATING MATMUL: \n");
     LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
@@ -1729,12 +1902,46 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     return broadcastValAcrossVector(NumElems, BroadcastVal, InsertBefore);
   }
 
+  Value *createBroadCastIntrinsic(Value *Input,
+      Value *BroadcastVal, unsigned NumElems, Instruction *InsertBefore) {
+    // Generate the vector splat intrinsic
+    auto *RetTy = FixedVectorType::get(BroadcastVal->getType(), NumElems);
+    auto *SplatIntrinsic = Intrinsic::getDeclaration(InsertBefore->getModule(), 
+                                  Intrinsic::vector_splat, ArrayRef<Type*>({RetTy}));
+    std::vector<Value *> Args {Input, BroadcastVal};
+    return CallInst::Create(SplatIntrinsic, Args, "", InsertBefore);
+  }
+
+  Value *createBroadCastIntrinsic(
+          Value *BroadcastVal, unsigned NumElems, Instruction *InsertBefore) {
+    // Since no input is given, create a poison vector
+    auto *Input = PoisonValue::get(FixedVectorType::get(BroadcastVal->getType(), NumElems));
+    createBroadCastIntrinsic(Input, BroadcastVal, NumElems, InsertBefore);
+  }
+
+  Value *generateBroadcastKernel(Value *Input,
+      Value *BroadcastVal, unsigned NumElems, Instruction *InsertBefore) {
+    // If the given value to be broadcast is a constant value, just
+    // generate a constant vector.
+    if (auto *C = dyn_cast<Constant>(BroadcastVal)) {
+      std::vector<Constant *> ConstTensorVec;
+      for (unsigned I = 0; I < NumElems; I++) {
+        ConstTensorVec.push_back(C);
+      }
+      return ConstantVector::get(ArrayRef<Constant *>(ConstTensorVec));
+    }
+
+    // Just generate splat intrinsic
+    return createBroadCastIntrinsic(Input, BroadcastVal, NumElems, InsertBefore);
+  }
+
   Value *lowerBroadcast(CallInst *Broadcast) {
     auto *Input = TI->getTensorOperand(Broadcast, 0);
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     unsigned NumElems = InputTensor.getTensorSize();
     auto *BroadcastVal = Broadcast->getArgOperand(1);
-
+    if(LowerToVectorIntrinsics)
+      return generateBroadcastKernel(Input, BroadcastVal, NumElems, Broadcast);
     return generateBroadcastKernel(BroadcastVal, NumElems, Broadcast);
   }
 
@@ -2166,4 +2373,3 @@ INITIALIZE_PASS_END(
 FunctionPass *llvm::createLowerTensorIntrinsicsPass() {
   return new LowerTensorIntrinsicsLegacyPass();
 }
-
