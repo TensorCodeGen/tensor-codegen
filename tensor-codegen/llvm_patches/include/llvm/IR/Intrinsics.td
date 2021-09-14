@@ -1534,7 +1534,7 @@ let IntrProperties = [IntrNoMem] in {
   def int_vector_reduce_smin : DefaultAttrsIntrinsic<[LLVMVectorElementType<0>],
                                          [llvm_anyvector_ty]>;
   def int_vector_reduce_umax : DefaultAttrsIntrinsic<[LLVMVectorElementType<0>],
-                                         [llvm_anyvector_ty]>;
+                                         [llvm_anyvector_ty]>;  
   def int_vector_reduce_umin : DefaultAttrsIntrinsic<[LLVMVectorElementType<0>],
                                          [llvm_anyvector_ty]>;
   def int_vector_reduce_fmax : DefaultAttrsIntrinsic<[LLVMVectorElementType<0>],
@@ -1705,10 +1705,27 @@ def int_tensor_transpose : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty],
                                         [IntrNoMem, IntrSpeculatable]>;
 
 
+//===---------- Intrinsics to represent tensor memory operations -----------------===//
+
+def int_tensor_load : Intrinsic<[llvm_token_ty], [llvm_any_ty, llvm_anyvector_ty, llvm_anyvector_ty,
+                                                 llvm_anyvector_ty, llvm_anyvector_ty],
+                                                 [IntrSpeculatable, IntrReadMem, ReadOnly<ArgIndex<0>>]>;
+
+
+def int_tensor_store : Intrinsic<[], [llvm_any_ty, llvm_anyvector_ty, llvm_token_ty],
+                                                [IntrWriteMem, WriteOnly<ArgIndex<0>>]>;
+
+
+//===---------- Intrinsics to represent 2D tensor operations -----------------===//
+
+def int_tensor_mma : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_token_ty, llvm_token_ty],
+                                                                  [IntrSpeculatable, IntrNoMem]>;
+
+
 //===---------- Intrinsics to represent vector operations -----------------===//
 
 def int_vector_splat : Intrinsic<[llvm_anyvector_ty], [llvm_anyvector_ty, LLVMVectorElementType<0>],
-                                        [IntrNoMem, IntrSpeculatable]>;
+                                                            [IntrNoMem, IntrSpeculatable]>;
 
 def int_vector_reduce_mac_acc : Intrinsic<[llvm_anyvector_ty], [llvm_anyvector_ty, llvm_anyvector_ty,
                                                             llvm_anyvector_ty, llvm_anyint_ty],

@@ -39,7 +39,7 @@
 #include "llvm/Transforms/Scalar/LowerTensorIntrinsics.h"
 
 #include <fstream>
-
+#include <limits>
 
 using namespace llvm;
 
@@ -51,22 +51,23 @@ static cl::opt<std::string> ReadKnobsFrom(
     "read-knobs-from", cl::desc("If set, read knob values from the given file "
                                 "and lower instructions with these values"));
 
+//struct CodeGenKnobs {
+  unsigned TileSize_M = 2;
+  unsigned TileSize_N = 1;
+  unsigned TileSize_K = 10;
 
-static cl::opt<bool> LowerToVectorIntrinsics(
-    "use-vector-intrinsics", cl::desc("If set, lower tensor operations to vector"
-                                      "intrinsics"));
+  unsigned TileSize = 2;
 
-unsigned TileSize_M = 2;
-unsigned TileSize_N = 2;
-unsigned TileSize_K = 2;
+  bool FuseTransposeAndMatmul = false;
 
-unsigned TileSize = 2;
+  bool InitTensorsWithMemCpy = true;
 
-bool FuseTransposeAndMatmul = false;
+  unsigned InnerLoopUnrollFactor = 0;
 
-bool InitTensorsWithMemCpy = true;
+  bool LowerToVectorIntrinsics = false;
 
-unsigned InnerLoopUnrollFactor = 0;
+  bool LowerToTileIntrinsics = false;
+//};
 
 struct TiledLoopNestInfo {
   /// Loop Bounds from outermost loop to innermost loop
@@ -138,7 +139,7 @@ BasicBlock *CreateLoop(
   BasicBlock *Tmp = PreheaderBr->getSuccessor(0);
   PreheaderBr->setSuccessor(0, Header);
 
-  if (MustHaveBody) {
+  if(MustHaveBody) {
     DTU.applyUpdatesPermissive({
         {DominatorTree::Delete, Preheader, Tmp},
         {DominatorTree::Insert, Header, Body},
@@ -218,6 +219,40 @@ void CreateTiledLoops(
   TI.InnerLoopBody = Body;
 }
 
+static Constant *GetConstantValue(LLVMContext &Ctx, Type *Ty, int64_t Val) {
+  switch (Ty->getTypeID()) {
+  case Type::IntegerTyID:
+    return ConstantInt::get(Type::getInt32Ty(Ctx), (int)Val);
+  case Type::FloatTyID:
+    return ConstantFP::get(Type::getFloatTy(Ctx), (float)Val);
+  case Type::DoubleTyID:
+    return ConstantFP::get(Type::getDoubleTy(Ctx), (double)Val);
+  case Type::HalfTyID:
+  case Type::BFloatTyID:
+  default:
+    assert(false && "Invalid element type.");
+  }
+  return nullptr;
+}
+
+static Value *ConvertToFloat(Value *V, Instruction *InsertBefore) {
+  switch (V->getType()->getTypeID()) {
+  case Type::IntegerTyID:
+    return new SIToFPInst(
+        V, Type::getFloatTy(InsertBefore->getParent()->getContext()), "",
+        InsertBefore);
+  case Type::FloatTyID:
+  case Type::DoubleTyID:
+    return V;
+  case Type::HalfTyID:
+  case Type::BFloatTyID:
+  default:
+    assert(false && "Invalid element type.");
+  }
+  return nullptr;
+}
+
+
 class LowerTensorIntrinsics {
 public:
   Function &Func;
@@ -231,19 +266,49 @@ private:
   // Track the instructions that need to be removed
   SmallPtrSet<Instruction *, 16> ToBeRemoved;
 
-  // Map the instructions with what values need to be used
-  // to remove them.
-  DenseMap<Instruction *, Instruction *> ReplacementMap;
+  class TargetRegInfo {
+
+    // Target register info for 2D tile registers
+    std::vector<TensorType> TileRegTypeInfo;
+
+  public:
+    TargetRegInfo() {}
+
+    // Find the appropriate tile register that works with the given
+    // cache block.
+    TensorType &getAptTileRegTensorType(TensorType &CacheTileType) {
+      unsigned CacheNumRows = CacheTileType.getShapeVector()[0];
+      unsigned CacheNumCols = CacheTileType.getShapeVector()[1];
+      for(auto &RegTileType : TileRegTypeInfo) {
+        unsigned RegNumRows = RegTileType.getShapeVector()[0];
+        unsigned RegNumCols = RegTileType.getShapeVector()[1];
+        if(CacheTileType.getLayout() == RegTileType.getLayout()) {
+          if(CacheNumRows % RegNumRows == 0 && CacheNumCols % RegNumCols == 0) 
+            return RegTileType;
+        } else {
+          if(CacheNumRows % RegNumCols == 0 && CacheNumCols % RegNumRows == 0) 
+            return RegTileType;
+        }
+      }
+      llvm_unreachable("Set the cache dimensions appropriately.");
+    }
+  };
+
+  // This tracks information about the target registers
+  TargetRegInfo TTRegInfo;
 
 public:
   LowerTensorIntrinsics(
       Function &F, TargetTransformInfo &TTI, DominatorTree *DT, LoopInfo *LI,
       TensorInfo *TI)
       : Func(F), DL(F.getParent()->getDataLayout()), TTI(TTI), DT(DT), LI(LI),
-        TI(TI) {}
+        TI(TI) {
+          TTRegInfo = TargetRegInfo();
+  }
 
-  class TensorMapinfo {
+  class CommonTensorInfo {
   public:
+
     bool isRowMajor(TensorType &Tensor) {
       SmallVector<unsigned, 4> &LayoutVector = Tensor.getLayoutVector();
       unsigned NumDims = LayoutVector.size();
@@ -270,9 +335,13 @@ public:
       return ShapeVector[ShapeVector.size() - 1];
     }
 
+    unsigned getNumElems(TensorType &Tensor) {
+      return getNumRows(Tensor) * getNumColumns(Tensor);
+    }
+
     unsigned getStride(TensorType &Tensor) { return getNumColumns(Tensor); }
 
-    virtual unsigned getNumOutputTileVectors() const = 0;
+    virtual unsigned getNumOutputTiles() const = 0;
 
     virtual TensorType &getOutputTensor() = 0;
 
@@ -280,10 +349,12 @@ public:
 
     virtual Value *getOutputTileVector(unsigned Index) = 0;
 
+    virtual Value *getOutput2DTile(unsigned HIndex, unsigned VIndex) = 0;
+
     virtual SmallVector<Value *, 4> &getOutTensorIndices() = 0;
   };
 
-  class MatMulInfo : public TensorMapinfo {
+  class MatMulInfo : public CommonTensorInfo {
   public:
     // Input tensor dimensions
     unsigned LTensorDim;
@@ -295,26 +366,43 @@ public:
     TensorType RTensor;
     TensorType OutputTensor;
 
-    // Tile dimensions
-    unsigned LTileDim;
-    unsigned RTileDim;
-    unsigned TileCommonDim;
+    // Block dimensions
+    unsigned LBlockDim;
+    unsigned RBlockDim;
+    unsigned BlockCommonDim;
 
     // Indices for the input and output tensors
+    // These are useful for indexing into tensors to access blocks.
     SmallVector<Value *, 4> LTensorIndices;
     SmallVector<Value *, 4> RTensorIndices;
     SmallVector<Value *, 4> OutTensorIndices;
 
-    // Tile vectors
+    // 1-d Tile vectors
     SmallVector<Value *, 16> LTileVector;
     SmallVector<Value *, 16> RTileVector;
-    SmallVector<Value *, 16> OutTileVector;
+    SmallVector<Value *, 16> OutTiles;
     SmallVector<PHINode *, 16> TilePHIs;
 
-    // Tensor type info for the tiles
+    // Maps for 2D tile registers
+    DenseMap<unsigned, std::vector<Value *>> LTileMap;
+    DenseMap<unsigned, std::vector<Value *>> RTileMap;
+    DenseMap<unsigned, std::vector<Value *>> Out2DTiles;
+    DenseMap<unsigned, std::vector<PHINode *>> Tiles2DPHIs;
+
+    // Tensor type info for the block
     TensorType LTile;
     TensorType RTile;
     TensorType OutTile;
+
+    // Target register info for this operation
+    TensorType L2DTileReg;
+    TensorType R2DTileReg;
+    TensorType Out2DTileReg;
+
+    // Number of tile registers along different block dimensions
+    unsigned Num2DRegTileRows;
+    unsigned Num2DRegTileCols;
+    unsigned Num2DRegTileCommon;
 
     // Loop nest info
     TiledLoopNestInfo LoopNestInfo;
@@ -325,13 +413,15 @@ public:
       return LoopNestInfo.LoopLatches[LoopNestInfo.LoopLatches.size() - 2];
     }
 
-    unsigned getNumOutputTileVectors() const { return OutTileVector.size(); }
+    unsigned getNumOutputTiles() const { return OutTiles.size(); }
 
     TensorType &getOutputTensor() { return OutputTensor; }
 
     TensorType &getOutputTile() { return OutTile; }
 
-    Value *getOutputTileVector(unsigned Index) { return OutTileVector[Index]; }
+    Value *getOutputTileVector(unsigned Index) { return OutTiles[Index]; }
+
+    Value *getOutput2DTile(unsigned HIndex, unsigned VIndex)  { return Out2DTiles[HIndex][VIndex]; }
 
     SmallVector<Value *, 4> &getOutTensorIndices() { return OutTensorIndices; }
 
@@ -405,17 +495,20 @@ public:
 
       // Set the indices information
       setIndicesInfo();
+
+      // Set the target register info
+      setRegInfo(InsertBefore->getModule()->getContext());
     }
 
     void insertTilePHIs(Type *ElemType) {
       unsigned TileRows;
       unsigned TileCols;
       if (isColumnMajor(OutputTensor)) {
-        TileRows = RTileDim;
-        TileCols = LTileDim;
+        TileRows = RBlockDim;
+        TileCols = LBlockDim;
       } else {
-        TileRows = LTileDim;
-        TileCols = RTileDim;
+        TileRows = LBlockDim;
+        TileCols = RBlockDim;
       }
 
       auto *TileVecTy = FixedVectorType::get(ElemType, TileCols);
@@ -430,16 +523,74 @@ public:
             TileVecTy, 2, "result.vec." + Twine(I), InnerHeaderTerminator);
         Phi->addIncoming(
             ConstantAggregateZero::get(TileVecTy), InnerLoopPreheader);
-        OutTileVector.push_back(Phi);
+        OutTiles.push_back(Phi);
         TilePHIs.push_back(Phi);
+      }
+    }
+
+    void insert2DTilePHIs(Type *ElemType) {
+      unsigned NumHeaders = LoopNestInfo.LoopHeaders.size();
+      BasicBlock *InnerLoopHeader = LoopNestInfo.LoopHeaders[NumHeaders - 1];
+      unsigned NumPreheaders = LoopNestInfo.LoopPreheaders.size();
+      BasicBlock *InnerLoopPreheader =
+                    LoopNestInfo.LoopPreheaders[NumPreheaders - 1];
+      auto *InnerHeaderTerminator = InnerLoopHeader->getTerminator();
+
+      unsigned TileSize = getNumRows(Out2DTileReg) * getNumColumns(Out2DTileReg);
+      auto *TileVecTy = FixedVectorType::get(ElemType, TileSize);
+      for (unsigned I = 0; I < Num2DRegTileRows; I++) {
+        for (unsigned J = 0; J < Num2DRegTileCols; J++) {
+          auto *Phi = PHINode::Create(
+              TileVecTy, 2, "result.tile." + Twine(I) + "." + Twine(J), 
+              InnerHeaderTerminator);
+          Phi->addIncoming(
+              ConstantAggregateZero::get(TileVecTy), InnerLoopPreheader);
+          Tiles2DPHIs[I].push_back(Phi);
+        }
+      }
+      
+      // Insert typeinfo intrinsics after the PHIs
+      auto RegPropertiesValVect = Out2DTileReg.getTensorPropertiesValueVector();
+      auto RegPropertiesTypeVect = Out2DTileReg.getTensorPropertiesTypeVector();
+      std::vector<Type *> TyArgs = {TileVecTy};
+      TyArgs.insert(TyArgs.end(), RegPropertiesTypeVect.begin(), RegPropertiesTypeVect.end());
+      auto *TypeInfoFunc = Intrinsic::getDeclaration(InnerHeaderTerminator->getModule(), 
+                    Intrinsic::tensor_typeinfo, ArrayRef<Type *>(TyArgs));
+      errs() << "TYPEINFO INTRINSIC: " << *TypeInfoFunc << "\n";
+      for (unsigned I = 0; I < Num2DRegTileRows; I++) {
+        for (unsigned J = 0; J < Num2DRegTileCols; J++) {
+          std::vector<Value *> Args = {Tiles2DPHIs[I][J]};
+          Args.insert(Args.end(), RegPropertiesValVect.begin(), RegPropertiesValVect.end());
+          auto *TypeInfo = CallInst::Create(TypeInfoFunc, Args,
+                              "tile.phi.typeinfo." + Twine(I) + "." + Twine(J), 
+                              InnerHeaderTerminator);
+          Out2DTiles[I].push_back(TypeInfo);
+        }
       }
     }
 
     void completeTilePHIs() {
       BasicBlock *InnerLoopLatch =
           LoopNestInfo.LoopLatches[LoopNestInfo.LoopLatches.size() - 1];
-      for (unsigned I = 0; I < OutTileVector.size(); I++) {
-        TilePHIs[I]->addIncoming(OutTileVector[I], InnerLoopLatch);
+      for (unsigned I = 0; I < OutTiles.size(); I++) {
+        TilePHIs[I]->addIncoming(OutTiles[I], InnerLoopLatch);
+      }
+    }
+    
+    void complete2DTilePHIs() {
+      errs() << "COMPLETE TILE PHIS\n";
+      BasicBlock *InnerLoopLatch =
+          LoopNestInfo.LoopLatches[LoopNestInfo.LoopLatches.size() - 1];
+      for (unsigned I = 0; I < Num2DRegTileRows; I++) {
+        for (unsigned J = 0; J < Num2DRegTileCols; J++) {
+          // Now get the MMA value. The output values tracked using the map
+          // are token values from typeinfo.
+          auto *II = dyn_cast<IntrinsicInst>(Out2DTiles[I][J]);
+          assert(II && II->getIntrinsicID() == Intrinsic::tensor_typeinfo);
+          auto *TileMMA = II->getArgOperand(0);
+          Tiles2DPHIs[I][J]->addIncoming(TileMMA, InnerLoopLatch);
+          errs() << "--PHI: " << Tiles2DPHIs[I][J] << "\n";
+        }
       }
     }
 
@@ -455,23 +606,15 @@ public:
         LoopSteps.push_back(1);
         LoopStartIndices.push_back(0);
       }
-      LoopBounds.push_back(LTensorDim);
-      LoopBounds.push_back(RTensorDim);
-      LoopBounds.push_back(CommonDim);
-
-      LoopSteps.push_back(TileSize_M);
-      LoopSteps.push_back(TileSize_N);
-      LoopSteps.push_back(TileSize_K);
-
-      LoopStartIndices.push_back(0);
-      LoopStartIndices.push_back(0);
-      LoopStartIndices.push_back(0);
+      LoopBounds.insert(LoopBounds.end(), {LTensorDim, RTensorDim, CommonDim});
+      LoopSteps.insert(LoopSteps.end(), {TileSize_M, TileSize_N, TileSize_K});
+      LoopStartIndices.insert(LoopStartIndices.end(), {0, 0, 0});
 
       LoopNestInfo = TiledLoopNestInfo(LoopBounds, LoopSteps, LoopStartIndices);
 
-      LTileDim = TileSize_M;
-      RTileDim = TileSize_N;
-      TileCommonDim = TileSize_K;
+      LBlockDim = TileSize_M;
+      RBlockDim = TileSize_N;
+      BlockCommonDim = TileSize_K;
     }
 
     void setIndicesInfo() {
@@ -507,13 +650,13 @@ public:
       SmallVector<unsigned, 4> ShapeVector;
       SmallVector<unsigned, 4> LayoutVector;
       if (isColumnMajor(LTensor)) {
-        ShapeVector.push_back(TileCommonDim);
-        ShapeVector.push_back(LTileDim);
+        ShapeVector.push_back(BlockCommonDim);
+        ShapeVector.push_back(LBlockDim);
         LayoutVector.push_back(1);
         LayoutVector.push_back(0);
       } else {
-        ShapeVector.push_back(LTileDim);
-        ShapeVector.push_back(TileCommonDim);
+        ShapeVector.push_back(LBlockDim);
+        ShapeVector.push_back(BlockCommonDim);
         LayoutVector.push_back(0);
         LayoutVector.push_back(1);
       }
@@ -530,13 +673,13 @@ public:
       ShapeVector.clear();
       LayoutVector.clear();
       if (isColumnMajor(RTensor)) {
-        ShapeVector.push_back(RTileDim);
-        ShapeVector.push_back(TileCommonDim);
+        ShapeVector.push_back(RBlockDim);
+        ShapeVector.push_back(BlockCommonDim);
         LayoutVector.push_back(1);
         LayoutVector.push_back(0);
       } else {
-        ShapeVector.push_back(TileCommonDim);
-        ShapeVector.push_back(RTileDim);
+        ShapeVector.push_back(BlockCommonDim);
+        ShapeVector.push_back(RBlockDim);
         LayoutVector.push_back(0);
         LayoutVector.push_back(1);
       }
@@ -549,14 +692,14 @@ public:
       LayoutVector.clear();
       if (isColumnMajor(OutputTensor)) {
         // Column major case
-        ShapeVector.push_back(RTileDim);
-        ShapeVector.push_back(LTileDim);
+        ShapeVector.push_back(RBlockDim);
+        ShapeVector.push_back(LBlockDim);
         LayoutVector.push_back(1);
         LayoutVector.push_back(0);
       } else {
         // Row major case
-        ShapeVector.push_back(LTileDim);
-        ShapeVector.push_back(RTileDim);
+        ShapeVector.push_back(LBlockDim);
+        ShapeVector.push_back(RBlockDim);
         LayoutVector.push_back(0);
         LayoutVector.push_back(1);
       }
@@ -564,9 +707,25 @@ public:
       // Set the tensor type information for the output tile
       OutTile = TensorType(Ctx, ShapeVector, LayoutVector, PaddingVector);
     }
+
+    void setRegInfo(LLVMContext &Ctx) {
+        SmallVector<unsigned, 4> ShapeVector {2, 2};
+        SmallVector<unsigned, 4> LayoutVector {0, 1};
+        SmallVector<unsigned, 4> PaddingVector {0, 0};
+        L2DTileReg = TensorType(Ctx, ShapeVector, LayoutVector, PaddingVector);
+        R2DTileReg = TensorType(Ctx, ShapeVector, LayoutVector, PaddingVector);
+        Out2DTileReg = TensorType(Ctx, ShapeVector, LayoutVector, PaddingVector);
+        //L2DTileReg = TTRegInfo.getAptTileRegTensorType(LTile);
+        //R2DTileReg = TTRegInfo.getAptTileRegTensorType(RTile);
+        //Out2DTileReg = TTRegInfo.getAptTileRegTensorType(OutTile);
+
+        Num2DRegTileRows = getNumRows(OutTile) / getNumRows(Out2DTileReg);
+        Num2DRegTileCols = getNumColumns(OutTile) / getNumColumns(Out2DTileReg);
+        Num2DRegTileCommon = getNumColumns(LTile) / getNumColumns(L2DTileReg);
+    }
   };
 
-  class ElementWiseInfo : public TensorMapinfo {
+  class ElementWiseInfo : public CommonTensorInfo {
   public:
     // Input/output tensor type infomation
     TensorType Tensor;
@@ -610,13 +769,15 @@ public:
       return (Tensor.getNumDimensions() - 1);
     }
 
-    unsigned getNumOutputTileVectors() const { return 0; }
+    unsigned getNumOutputTiles() const { return 0; }
 
     TensorType &getOutputTensor() { return *(new TensorType()); }
 
     TensorType &getOutputTile() { return *(new TensorType()); }
 
     Value *getOutputTileVector(unsigned Index) { return nullptr; }
+
+    Value *getOutput2DTile(unsigned HIndex, unsigned VIndex)  { return nullptr; }
 
     SmallVector<Value *, 4> &getOutTensorIndices() { return TensorIndices; }
 
@@ -656,7 +817,7 @@ public:
     }
   };
 
-  class TensorTransformInfo : public TensorMapinfo {
+  class TensorTransformInfo : public CommonTensorInfo {
   public:
     // Input and output tensor type information
     TensorType InputTensor;
@@ -672,7 +833,7 @@ public:
 
     // PHI nodes for the input and output tiles
     SmallVector<Value *, 16> InTileVector;
-    SmallVector<Value *, 16> OutTileVector;
+    SmallVector<Value *, 16> OutTiles;
 
     // Tiled loop nest info
     TiledLoopNestInfo LoopNestInfo;
@@ -681,13 +842,15 @@ public:
     SmallVector<Value *, 4> InTensorIndices;
     SmallVector<Value *, 4> OutTensorIndices;
 
-    unsigned getNumOutputTileVectors() const { return OutTileVector.size(); }
+    unsigned getNumOutputTiles() const { return OutTiles.size(); }
 
     TensorType &getOutputTensor() { return OutputTensor; }
 
     TensorType &getOutputTile() { return OutTile; }
 
-    Value *getOutputTileVector(unsigned Index) { return OutTileVector[Index]; }
+    Value *getOutputTileVector(unsigned Index) { return OutTiles[Index]; }
+
+    Value *getOutput2DTile(unsigned HIndex, unsigned VIndex)  { return nullptr; }
 
     SmallVector<Value *, 4> &getOutTensorIndices() { return OutTensorIndices; }
 
@@ -702,8 +865,7 @@ public:
 
     TensorTransformInfo(TensorType &InTensor, TensorType &OutTensor)
         : InputTensor(InTensor), OutputTensor(OutTensor) {
-      assert(
-          isValidTranspose(InputTensor, OutputTensor) &&
+      assert(isValidTranspose(InputTensor, OutputTensor) &&
           "Cannot create loop nest for invalid transposes.");
     }
 
@@ -737,7 +899,7 @@ public:
 
       auto *TileVecTy = FixedVectorType::get(ElemType, TileCols);
       for (unsigned I = 0; I < TileRows; I++) {
-        OutTileVector.push_back(UndefValue::get(TileVecTy));
+        OutTiles.push_back(UndefValue::get(TileVecTy));
       }
     }
 
@@ -839,46 +1001,85 @@ public:
   }
 
   Value *computeVectorAddr(
-      Value *BasePtr, Value *VecIdx, Value *Stride, unsigned NumElements,
+      Value *BasePtr, Value *Index, Value *TensorStride, unsigned NumElements,
       Type *EltType, Instruction *InsertBefore) {
-
     assert(
-        (!dyn_cast<ConstantInt>(Stride) ||
-         dyn_cast<ConstantInt>(Stride)->getZExtValue() >= NumElements) &&
+        (!dyn_cast<ConstantInt>(TensorStride) ||
+         dyn_cast<ConstantInt>(TensorStride)->getZExtValue() >= NumElements) &&
         "Stride must be >= the number of elements in the result vector.");
-    unsigned AS = dyn_cast<PointerType>(BasePtr->getType())->getAddressSpace();
 
     // Get pointer to the start of the selected vector. Skip GEP creation,
     // if we select vector 0.
     Instruction *VecStart;
-    if (dyn_cast<ConstantInt>(VecIdx) &&
-        dyn_cast<ConstantInt>(VecIdx)->isZero()) {
+    if (dyn_cast<ConstantInt>(Index) &&
+        dyn_cast<ConstantInt>(Index)->isZero()) {
       VecStart = dyn_cast<Instruction>(BasePtr);
     } else {
-      VecStart = BinaryOperator::Create(
-          Instruction::Mul, VecIdx, Stride, "vec.start", InsertBefore);
+      auto *Offset = BinaryOperator::Create(
+          Instruction::Mul, Index, TensorStride, "vec.start", InsertBefore);
       VecStart = GetElementPtrInst::Create(
-          EltType, BasePtr, VecStart, "vec.gep", InsertBefore);
+          EltType, BasePtr, Offset, "vec.gep", InsertBefore);
     }
 
     // Cast elementwise vector start pointer to a pointer to a vector
     // (EltType x NumElements)*.
-    auto *VecType = FixedVectorType::get(EltType, NumElements);
-    Type *VecPtrType = PointerType::get(VecType, AS);
+    if(NumElements == 1)
+      return VecStart;
+    unsigned AS = dyn_cast<PointerType>(BasePtr->getType())->getAddressSpace();
+    auto *VecPtrType = PointerType::get(
+        FixedVectorType::get(EltType, NumElements), AS);
     return CastInst::CreatePointerCast(
         VecStart, VecPtrType, "vec.cast", InsertBefore);
   }
 
-  /// Indices to index into the given tensor are assumed to be frmom outermost
-  /// dimensions to
-  /// innermost dimensions.
+  Value *computeTileAddr(
+      Value *BasePtr, Value *ColIndex, Value *RowIndex, Value *TensorStride,
+      unsigned NumElements, Type *EltType, Instruction *InsertBefore) {
+    assert(
+        (!dyn_cast<ConstantInt>(TensorStride) ||
+         dyn_cast<ConstantInt>(TensorStride)->getZExtValue() >= NumElements) &&
+        "Stride must be >= the number of elements in the result vector.");
+
+    // Get pointer to the start of the selected vector. Skip GEP creation,
+    // if we select vector 0.
+    Instruction *VecStart;
+    if (dyn_cast<ConstantInt>(ColIndex)->getZExtValue() == 0) {
+      if(dyn_cast<ConstantInt>(RowIndex)->getZExtValue() == 0) {
+        VecStart = dyn_cast<Instruction>(BasePtr);
+      } else {
+        VecStart = GetElementPtrInst::Create(
+          EltType, BasePtr, ColIndex, "tile.gep", InsertBefore);
+      }
+    } else {
+      Value *Offset;
+      if(dyn_cast<ConstantInt>(RowIndex)->getZExtValue() != 0) {
+        Offset = BinaryOperator::Create(
+            Instruction::Mul, RowIndex, TensorStride, "tile.stride", InsertBefore);
+        Offset = BinaryOperator::Create(
+            Instruction::Add, ColIndex, Offset, "tile.offset", InsertBefore);
+      } else {
+        Offset = ColIndex;
+      }
+      VecStart = GetElementPtrInst::Create(
+          EltType, BasePtr, Offset, "tile.gep", InsertBefore);
+    }
+
+    // Cast elementwise vector start pointer to a pointer to a vector i8*.
+    unsigned AS = dyn_cast<PointerType>(BasePtr->getType())->getAddressSpace();
+    auto *PtrTy = PointerType::get(
+            Type::getInt8Ty(InsertBefore->getParent()->getContext()), AS);
+    return CastInst::CreatePointerCast(
+            VecStart, PtrTy, "tile.cast", InsertBefore);
+  }
+
+  /// Indices to index into the given tensor are assumed to be from outermost
+  /// dimensions to innermost dimensions.
   Value *computeIndex(
       TensorType &Tensor, SmallVector<Value *, 4> &InductionVars,
       unsigned NumCollapsedLoops, Instruction *InsertBefore) {
     SmallVector<unsigned, 4> &Shape = Tensor.getShapeVector();
     unsigned NumDims = Shape.size();
-    assert(
-        InductionVars.size() == (NumDims - NumCollapsedLoops) &&
+    assert(InductionVars.size() == (NumDims - NumCollapsedLoops) &&
         "The number indices provided must be same as number of dimensions.");
 
     // If there is only one index, then we just return the index
@@ -921,26 +1122,81 @@ public:
   template <typename T>
   SmallVector<Value *, 16> loadTile(
       T &TensorOpInfo, Value *TensorPtr, TensorType &InTensor,
-      TensorType &InTile, Type *EltTy, SmallVector<Value *, 4> &Indices,
+      TensorType &InBlock, Type *EltTy, SmallVector<Value *, 4> &Indices,
       MaybeAlign Align, bool IsVolatile, Instruction *InsertBefore) {
 
     auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
-    auto *Offset = computeIndex(InTensor, Indices, 0, InsertBefore);
+    auto *Offset = computeIndex(InTensor, Indices, false, InsertBefore);
     auto *TileStart = GetElementPtrInst::Create(
-        EltTy, TensorPtr, ArrayRef<Value *>(Offset), "tile.start",
-        InsertBefore);
+        EltTy, TensorPtr, ArrayRef<Value *>(Offset), "tile.start", InsertBefore);
 
     SmallVector<Value *, 16> Result;
-    auto *VecTy = FixedVectorType::get(EltTy, TensorOpInfo.getStride(InTile));
+    Type *LoadTy;
+    if (TensorOpInfo.getStride(InBlock) == 1)
+      LoadTy = EltTy;
+    else
+      LoadTy = FixedVectorType::get(EltTy, TensorOpInfo.getStride(InBlock));
     auto *Stride = ConstantInt::get(Int32Ty, TensorOpInfo.getStride(InTensor));
-    for (unsigned I = 0; I < TensorOpInfo.getNumRows(InTile); ++I) {
+    for (unsigned I = 0; I < TensorOpInfo.getNumRows(InBlock); ++I) {
       auto *GEP = computeVectorAddr(
           TileStart, ConstantInt::get(Int32Ty, I), Stride,
-          TensorOpInfo.getStride(InTile), EltTy, InsertBefore);
+          TensorOpInfo.getStride(InBlock), EltTy, InsertBefore); 
       auto *Vector = new LoadInst(
-          VecTy, GEP, "row.load", IsVolatile,
+          LoadTy, GEP, "row.load", IsVolatile,
           getAlignForIndex(I, Stride, EltTy, Align), InsertBefore);
       Result.push_back(Vector);
+    }
+    return Result;
+  }
+
+  template <typename T>
+  SmallVector<Value *, 16> load2DTile(
+      T &TensorOpInfo, Value *TensorPtr, TensorType &InTensor,
+      TensorType &InBlock, TensorType &RegTile, Type *EltTy, 
+      SmallVector<Value *, 4> &Indices, 
+      DenseMap<unsigned, std::vector<Value *>> &LoadMap,
+      MaybeAlign Align, bool IsVolatile, const Twine Name,
+      Instruction *InsertBefore) {
+    
+    auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
+    auto *Offset = computeIndex(InTensor, Indices, false, InsertBefore);
+    auto *TileStart = GetElementPtrInst::Create(
+        EltTy, TensorPtr, ArrayRef<Value *>(Offset), "tile.start", InsertBefore);
+ 
+    // Determine the size of the  tile registers
+    auto RegTileTensorTypeValVect = RegTile.getTensorPropertiesValueVector();
+    auto RegTileTensorTypeTypeVect = RegTile.getTensorPropertiesTypeVector();
+    auto *TensorStride = ConstantInt::get(Int32Ty, TensorOpInfo.getStride(InTensor));
+    auto *StridesVector = ConstantVector::get(
+                  ArrayRef<Constant *>({ConstantInt::get(Int32Ty, 0), TensorStride}));
+    unsigned BlockNumRows = TensorOpInfo.getNumRows(InBlock);
+    unsigned BlockNumCols = TensorOpInfo.getNumColumns(InBlock); 
+    unsigned RegNumRows = TensorOpInfo.getNumRows(RegTile);
+    unsigned RegNumCols = TensorOpInfo.getNumColumns(RegTile);
+    auto *StrideVectTy = FixedVectorType::get(
+        Type::getInt32Ty(InsertBefore->getParent()->getContext()), 2);
+    SmallVector<Value *, 16> Result;
+    for (unsigned J = 0; J < BlockNumRows; J += RegNumRows) {
+      for (unsigned I = 0; I < BlockNumCols; I += RegNumCols) {
+        auto *GEP = computeTileAddr(
+            TileStart, ConstantInt::get(Int32Ty, I), ConstantInt::get(Int32Ty, J), 
+            TensorStride, TensorOpInfo.getNumElems(InBlock), EltTy, InsertBefore);
+        std::vector<Type *> ArgsTy = {GEP->getType()};
+        ArgsTy.insert(ArgsTy.end(), RegTileTensorTypeTypeVect.begin(), RegTileTensorTypeTypeVect.end());
+        ArgsTy.insert(ArgsTy.end(), {StrideVectTy});
+        auto *TileLoadFunc = Intrinsic::getDeclaration(InsertBefore->getModule(), 
+                        Intrinsic::tensor_load, ArrayRef<Type *>(ArgsTy));
+        std::vector<Value *> Args = {GEP};
+        Args.insert(Args.end(), RegTileTensorTypeValVect.begin(), RegTileTensorTypeValVect.end());
+        Args.insert(Args.end(), StridesVector);
+        auto *TileLoad = CallInst::Create(TileLoadFunc, Args, 
+                        Name +  "tile.load." + Twine(J / RegNumRows) 
+                        + "." + Twine(I / RegNumCols) , InsertBefore);
+        Result.push_back(TileLoad);
+
+        // Add load instruction to the tensor type to value map
+        LoadMap[J / RegNumRows].push_back(TileLoad);
+      }
     }
     return Result;
   }
@@ -952,23 +1208,16 @@ public:
 
     auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
     auto *Offset = computeIndex(
-        TensorOpInfo.getOutputTensor(), TensorOpInfo.getOutTensorIndices(), 0,
+        TensorOpInfo.getOutputTensor(), TensorOpInfo.getOutTensorIndices(), false,
         InsertBefore);
-
-    LLVM_DEBUG(dbgs() << "INSERTING COMPUTE INDEX: \n");
-    LLVM_DEBUG(dbgs() << *(InsertBefore->getParent()->getParent()) << "\n");
-    LLVM_DEBUG(dbgs() << "TENSOR PTR: " << TensorPtr << "\n");
 
     auto *TileStart = GetElementPtrInst::Create(
         EltTy, TensorPtr, ArrayRef<Value *>(Offset), "tile.start",
         InsertBefore);
 
-    LLVM_DEBUG(dbgs() << "INSERTING GET ELEM PTR: \n");
-    LLVM_DEBUG(dbgs() << *(InsertBefore->getParent()->getParent()) << "\n");
-
     auto *Stride = ConstantInt::get(
         Int32Ty, TensorOpInfo.getStride(TensorOpInfo.getOutputTensor()));
-    for (unsigned I = 0; I < TensorOpInfo.getNumOutputTileVectors(); ++I) {
+    for (unsigned I = 0; I < TensorOpInfo.getNumOutputTiles(); ++I) {
       auto *GEP = computeVectorAddr(
           TileStart, ConstantInt::get(Int32Ty, I), Stride,
           TensorOpInfo.getStride(TensorOpInfo.getOutputTile()), EltTy,
@@ -977,9 +1226,52 @@ public:
       new StoreInst(
           TensorOpInfo.getOutputTileVector(I), GEP, IsVolatile,
           getAlignForIndex(I, Stride, EltTy, MAlign), InsertBefore);
+    }
+  }
 
-      LLVM_DEBUG(dbgs() << "INSERTING STORE INST: \n");
-      LLVM_DEBUG(dbgs() << *(InsertBefore->getParent()->getParent()) << "\n");
+  template <typename T>
+  void store2DTile(
+      T &TensorOpInfo, Value *TensorPtr, TensorType &RegTile, 
+      Type *EltTy, MaybeAlign MAlign, bool IsVolatile, Instruction *InsertBefore) {
+
+    auto &OutTensor = TensorOpInfo.getOutputTensor();
+    auto &OutBlock = TensorOpInfo.getOutputTile();
+    auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
+    auto *Offset = computeIndex(
+        OutTensor, TensorOpInfo.getOutTensorIndices(), false,
+        InsertBefore);
+    auto *TileStart = GetElementPtrInst::Create(
+        EltTy, TensorPtr, ArrayRef<Value *>(Offset), "tile.start", InsertBefore);
+ 
+    // Determine the size of the  tile registers
+    auto RegTileTensorTypeValVect = RegTile.getTensorPropertiesValueVector();
+    auto RegTileTensorTypeTypeVect = RegTile.getTensorPropertiesTypeVector();
+    auto *TensorStride = ConstantInt::get(Int32Ty, TensorOpInfo.getStride(OutTensor));
+    auto *StridesVector = ConstantVector::get(
+                  ArrayRef<Constant *>({ConstantInt::get(Int32Ty, 0), TensorStride}));
+    unsigned BlockNumRows = TensorOpInfo.getNumRows(OutBlock);
+    unsigned BlockNumCols = TensorOpInfo.getNumColumns(OutBlock); 
+    unsigned RegNumRows = TensorOpInfo.getNumRows(RegTile);
+    unsigned RegNumCols = TensorOpInfo.getNumColumns(RegTile);
+    auto *StrideVectTy = FixedVectorType::get(
+        Type::getInt32Ty(InsertBefore->getParent()->getContext()), 2);
+
+    for (unsigned J = 0; J < BlockNumRows; J += RegNumRows) {
+      for (unsigned I = 0; I < BlockNumCols; I += RegNumCols) {
+        auto *GEP = computeTileAddr(
+            TileStart, ConstantInt::get(Int32Ty, I), ConstantInt::get(Int32Ty, J), 
+            TensorStride, TensorOpInfo.getNumElems(OutBlock), EltTy, InsertBefore);
+        std::vector<Type *> ArgsTy = {GEP->getType()};
+        ArgsTy.insert(ArgsTy.end(), {StrideVectTy});
+        ArgsTy.insert(ArgsTy.end(), {Type::getTokenTy(InsertBefore->getParent()->getContext())});
+        auto *TileStoreFunc = Intrinsic::getDeclaration(InsertBefore->getModule(), 
+                        Intrinsic::tensor_store, ArrayRef<Type *>(ArgsTy));
+        std::vector<Value *> Args = {GEP};
+        Args.insert(Args.end(), StridesVector);
+        Args.insert(Args.end(), 
+              {TensorOpInfo.getOutput2DTile(J / RegNumRows , I / RegNumCols)});
+        CallInst::Create(TileStoreFunc, Args, "", InsertBefore);
+      }
     }
   }
 
@@ -1026,17 +1318,26 @@ public:
   }
 
   void InsertCallToPrint(Value *V, Instruction *InsertBefore) {
-    auto *VecTy = FixedVectorType::get(
-        Type::getInt32Ty(InsertBefore->getParent()->getContext()), 4);
-    auto *Poison = PoisonValue::get(V->getType());
-    auto *I = new ShuffleVectorInst(
-        V, Poison, createSequentialMask(0, 4, 0), "to.print", InsertBefore);
-    std::vector<Type *> ArgsTy = {VecTy};
-    std::vector<Value *> Args = {I};
-    auto *Func = InsertBefore->getModule()->getFunction("print");
-    CallInst::Create(
-        Func->getFunctionType(), Func, ArrayRef<Value *>(Args), "",
-        InsertBefore);
+    if(V->getType()->isVectorTy()) {
+      auto *VecTy = FixedVectorType::get(
+          Type::getInt32Ty(InsertBefore->getParent()->getContext()), 4);
+      auto *Poison = PoisonValue::get(V->getType());
+      auto *I = new ShuffleVectorInst(
+          V, Poison, createSequentialMask(0, 4, 0), "to.print", InsertBefore);
+      std::vector<Type *> ArgsTy = {VecTy};
+      std::vector<Value *> Args = {I};
+      auto *Func = InsertBefore->getModule()->getFunction("print");
+      CallInst::Create(
+          Func->getFunctionType(), Func, ArrayRef<Value *>(Args), "",
+          InsertBefore);
+    } else {
+      std::vector<Type *> ArgsTy = {V->getType()};
+      std::vector<Value *> Args = {V};
+      auto *Func = InsertBefore->getModule()->getFunction("print2");
+      CallInst::Create(
+          Func->getFunctionType(), Func, ArrayRef<Value *>(Args), "",
+          InsertBefore);
+    }
   }
 
   void InsertCallToPrintIndex(Value *V, Instruction *InsertBefore) {
@@ -1049,17 +1350,18 @@ public:
         InsertBefore);
   }
 
+  template <typename T>
   Value *extractVector(
-      MatMulInfo MMInfo, TensorType TensorTypeInfo,
+      T &TensorInfo, TensorType TensorTypeInfo,
       SmallVector<Value *, 16> &TensorVect, unsigned I, unsigned J,
       unsigned NumElts, Instruction *InsertBefore) const {
     Value *Vec =
-        MMInfo.isColumnMajor(TensorTypeInfo) ? TensorVect[J] : TensorVect[I];
+        TensorInfo.isColumnMajor(TensorTypeInfo) ? TensorVect[J] : TensorVect[I];
     auto *Poison = PoisonValue::get(Vec->getType());
     return new ShuffleVectorInst(
         Vec, Poison,
         createSequentialMask(
-            MMInfo.isColumnMajor(TensorTypeInfo) ? I : J, NumElts, 0),
+            TensorInfo.isColumnMajor(TensorTypeInfo) ? I : J, NumElts, 0),
         "block", InsertBefore);
   }
 
@@ -1112,6 +1414,15 @@ public:
     return CallInst::Create(MacIntrinsic, Args, "", InsertBefore);
   }
 
+  Value *createReduceMacAccIntrinsic(
+            Value* Acc, Value *A, Value *B, unsigned BlockSize, Instruction *InsertBefore) {
+    auto *MacIntrinsic = Intrinsic::getDeclaration(InsertBefore->getModule(), 
+                      Intrinsic::vector_reduce_mac, ArrayRef<Type*>({A->getType()}));
+    auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
+    std::vector<Value *> Args = {Acc, A, B, ConstantInt::get(Int32Ty, BlockSize)};
+    return CallInst::Create(MacIntrinsic, Args, "", InsertBefore);
+  }
+
   Value *
   reduceVector(Value *Vect, unsigned NumElems, Instruction *InsertBefore) {
     auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
@@ -1154,23 +1465,21 @@ public:
     }
   }
 
-
-  void generateMatrixMultiplyKernel_1D(
+  void generateMatrixMultiply1DKernel(
       MatMulInfo &MMInfo, Type *EltType, Instruction *InsertBefore) {
     const unsigned VF = std::max<unsigned>(
         TTI.getRegisterBitWidth(true) /
-            EltType->getPrimitiveSizeInBits().getFixedSize(),
-        1U);
+            EltType->getPrimitiveSizeInBits().getFixedSize(), 1U);
 
     TensorType &LTileTensorType = MMInfo.LTile;
     TensorType &RTileTensorType = MMInfo.RTile;
-    unsigned R = MMInfo.LTileDim;
-    unsigned C = MMInfo.RTileDim;
-    unsigned M = MMInfo.TileCommonDim;
+    unsigned R = MMInfo.LBlockDim;
+    unsigned C = MMInfo.RBlockDim;
+    unsigned M = MMInfo.BlockCommonDim;
 
     SmallVector<Value *, 16> &A = MMInfo.LTileVector;
     SmallVector<Value *, 16> &B = MMInfo.RTileVector;
-    SmallVector<Value *, 16> &TileResult = MMInfo.OutTileVector;
+    SmallVector<Value *, 16> &TileResult = MMInfo.OutTiles;
 
     auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
     bool IsFP = EltType->isFloatingPointTy();
@@ -1310,22 +1619,66 @@ public:
     }
   }
 
+  void generateMatrixMultiply2DKernel(
+    MatMulInfo &MMInfo, Type *EltType, Instruction *InsertBefore) {
+    
+    unsigned NumLTilesRows = MMInfo.Num2DRegTileRows;
+    unsigned NumRTilesCols = MMInfo.Num2DRegTileCols;
+    unsigned NumTilesCommon = MMInfo.Num2DRegTileCommon;
+    auto &Out2DTileReg = MMInfo.Out2DTileReg;
+    auto &LTileMap = MMInfo.LTileMap;
+    auto &RTileMap = MMInfo.RTileMap;
+    auto &OutputTiles = MMInfo.Out2DTiles;
+    auto OutRegPropertiesValVect = Out2DTileReg.getTensorPropertiesValueVector();
+    auto OutRegPropertiesTypeVect = Out2DTileReg.getTensorPropertiesTypeVector();
+    unsigned OutTileSize = MMInfo.getNumRows(Out2DTileReg) * MMInfo.getNumColumns(Out2DTileReg);
+    auto *OutTileVecTy = FixedVectorType::get(EltType, OutTileSize);
+
+    auto &Ctx = InsertBefore->getParent()->getContext();
+    auto *TokenTy = Type::getTokenTy(Ctx);
+    auto *MMAFunc = Intrinsic::getDeclaration(InsertBefore->getModule(), 
+                    Intrinsic::tensor_mma, ArrayRef<Type *>({OutTileVecTy}));
+    errs() << "MMA INTRINSIC: " << *MMAFunc << "\n";
+    std::vector<Type *> TyArgs = {OutTileVecTy};
+    TyArgs.insert(TyArgs.end(), OutRegPropertiesTypeVect.begin(), OutRegPropertiesTypeVect.end());
+    auto *TypeInfoFunc = Intrinsic::getDeclaration(InsertBefore->getModule(), 
+                    Intrinsic::tensor_typeinfo, ArrayRef<Type *>(TyArgs));
+    errs() << "TYPEINFO INTRINSIC: " << *TypeInfoFunc << "\n";
+
+    if (MMInfo.isRowMajor(MMInfo.L2DTileReg) &&
+        MMInfo.isRowMajor(MMInfo.R2DTileReg)) {
+      // Perform the MMA operation
+      for (unsigned LJ = 0; LJ < NumLTilesRows; LJ++) {
+        for (unsigned LI = 0; LI < NumTilesCommon; LI++) {
+          for (unsigned RI = 0; RI < NumRTilesCols; RI++) {
+            auto *LTileLoad = LTileMap[LJ][LI];
+            auto *RTileLoad = RTileMap[LI][RI];
+            auto *TileMMA = CallInst::Create(MMAFunc,
+                            {OutputTiles[LJ][RI], LTileLoad, RTileLoad}, "tile.mma", InsertBefore);
+            std::vector<Value *> Args = {TileMMA};
+            Args.insert(Args.end(), OutRegPropertiesValVect.begin(), OutRegPropertiesValVect.end());
+            OutputTiles[LJ][RI] = CallInst::Create(TypeInfoFunc, Args, "tile.mma.typeinfo", InsertBefore);
+          }
+        }
+      }
+    }
+  }
+
   void generateMatrixMultiplyKernel(
       MatMulInfo &MMInfo, Type *EltType, Instruction *InsertBefore) {
     const unsigned VF = std::max<unsigned>(
         TTI.getRegisterBitWidth(true) /
-            EltType->getPrimitiveSizeInBits().getFixedSize(),
-        1U);
+            EltType->getPrimitiveSizeInBits().getFixedSize(), 1U);
 
     TensorType &LTileTensorType = MMInfo.LTile;
     TensorType &RTileTensorType = MMInfo.RTile;
-    unsigned R = MMInfo.LTileDim;
-    unsigned C = MMInfo.RTileDim;
-    unsigned M = MMInfo.TileCommonDim;
+    unsigned R = MMInfo.LBlockDim;
+    unsigned C = MMInfo.RBlockDim;
+    unsigned M = MMInfo.BlockCommonDim;
 
     SmallVector<Value *, 16> &A = MMInfo.LTileVector;
     SmallVector<Value *, 16> &B = MMInfo.RTileVector;
-    SmallVector<Value *, 16> &TileResult = MMInfo.OutTileVector;
+    SmallVector<Value *, 16> &TileResult = MMInfo.OutTiles;
 
     auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
     bool IsFP = EltType->isFloatingPointTy();
@@ -1466,11 +1819,9 @@ public:
             auto *LH = ExtractElementInst::Create(
                 A[I], ConstantInt::get(Int32Ty, K), "", InsertBefore);
             auto *Splat = broadcastValAcrossVector(BlockSize, LH, InsertBefore);
-            // InsertCallToPrint(Splat, InsertBefore);
             Sum = createMulAdd(
                 isSumZero && K == 0 ? nullptr : Sum, Splat, R, IsFP,
                 InsertBefore);
-            // InsertCallToPrint(Sum, InsertBefore);
           }
 
           // Result.setVector(I, insertVector(Result.getVector(I), J, Sum,
@@ -1514,50 +1865,73 @@ public:
     LLVM_DEBUG(dbgs() << "CREATING LOOP NEST: \n");
     LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
 
-    // Insert PHIs that represent the tiles
-    MMInfo.insertTilePHIs(EltType);
-
-    LLVM_DEBUG(dbgs() << "INSERTING PHIS: \n");
-    LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
-
-    // Inner loop body terminator
+     // Inner loop body terminator
     auto *InnerBodyTerminator = (MMInfo.getInnerLoopBody())->getTerminator();
 
-    // Load tiles of the operands.
-    MMInfo.LTileVector = loadTile<MatMulInfo>(
-        MMInfo, TI->getMemPtrFor(LTensor), LTensorType, MMInfo.LTile, EltType,
-        MMInfo.LTensorIndices, {}, false, InnerBodyTerminator);
-    MMInfo.RTileVector = loadTile<MatMulInfo>(
-        MMInfo, TI->getMemPtrFor(RTensor), RTensorType, MMInfo.RTile, EltType,
-        MMInfo.RTensorIndices, {}, false, InnerBodyTerminator);
+    if(LowerToTileIntrinsics) {
+      // Insert PHIs that represent the tiles
+      MMInfo.insert2DTilePHIs(EltType);
 
-    LLVM_DEBUG(dbgs() << "INSERTING LOADS: \n");
-    LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
+      errs() << "GENERATED PHIS: " << *(MatMul->getParent()->getParent()) << "\n";
 
-    // Generate the matmul kernel
-    if(LowerToVectorIntrinsics)
-      generateMatrixMultiplyKernel_1D(MMInfo, EltType, InnerBodyTerminator);
-    else
-      generateMatrixMultiplyKernel(MMInfo, EltType, InnerBodyTerminator);
+      LLVM_DEBUG(dbgs() << "INSERTING PHIS: \n");
+      LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
 
-    LLVM_DEBUG(dbgs() << "GENERATING MATMUL: \n");
-    LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
+      // Load tiles of the operands.
+      MMInfo.LTileVector = load2DTile<MatMulInfo>(
+          MMInfo, TI->getMemPtrFor(LTensor), LTensorType, MMInfo.LTile, MMInfo.L2DTileReg, 
+          EltType, MMInfo.LTensorIndices, MMInfo.LTileMap, {}, false, "L",
+          InnerBodyTerminator);
+      MMInfo.RTileVector = load2DTile<MatMulInfo>(
+          MMInfo, TI->getMemPtrFor(RTensor), RTensorType, MMInfo.RTile, MMInfo.R2DTileReg, 
+          EltType, MMInfo.RTensorIndices, MMInfo.RTileMap, {}, false, "R",
+          InnerBodyTerminator);
 
-    // Store tiles of outputs.
-    storeTile<MatMulInfo>(
-        MMInfo, TI->getMemPtrFor(MatMul), EltType, {}, false,
-        (MMInfo.getBlockToStoreTile())->getTerminator());
+      LLVM_DEBUG(dbgs() << "INSERTING LOADS: \n");
+      LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
+      errs() << "INSERTING LOADS: \n";
+      errs() << *(MatMul->getParent()->getParent()) << "\n";
 
-    LLVM_DEBUG(dbgs() << "INSERTING STORES: \n");
-    LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
+      generateMatrixMultiply2DKernel(MMInfo, EltType, InnerBodyTerminator);
 
-    // Finish completeling the PHIs for tiles
-    MMInfo.completeTilePHIs();
+      errs() << "GENERATED MATMUL KERNEL: \n" << *(InnerBodyTerminator->getParent()->getParent()) << "\n";
+
+      // Store tiles of outputs.
+      store2DTile<MatMulInfo>(
+          MMInfo, TI->getMemPtrFor(MatMul), MMInfo.Out2DTileReg, EltType, {}, false,
+          (MMInfo.getBlockToStoreTile())->getTerminator());
+
+      // Finish completeling the PHIs for tiles
+      MMInfo.complete2DTilePHIs();
+    } else {
+      // Insert PHIs that represent the tiles
+      MMInfo.insertTilePHIs(EltType);
+
+      // Generate the matmul kernel
+      if(LowerToVectorIntrinsics)
+        generateMatrixMultiply1DKernel(MMInfo, EltType, InnerBodyTerminator);
+      else
+        generateMatrixMultiplyKernel(MMInfo, EltType, InnerBodyTerminator);
+
+      LLVM_DEBUG(dbgs() << "GENERATING MATMUL: \n");
+      LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
+
+      // Store tiles of outputs.
+      storeTile<MatMulInfo>(
+          MMInfo, TI->getMemPtrFor(MatMul), EltType, {}, false,
+          (MMInfo.getBlockToStoreTile())->getTerminator());
+
+      LLVM_DEBUG(dbgs() << "INSERTING STORES: \n");
+      LLVM_DEBUG(dbgs() << *(MatMul->getParent()->getParent()) << "\n");
+
+      // Finish completeling the PHIs for tiles
+      MMInfo.completeTilePHIs();
+    }
 
     // Force unrolling of innermost loop
     forceUnrollOfLoop(
         LI->getLoopFor(MMInfo.getInnerLoopBody()), InnerLoopUnrollFactor);
-
+    
     // Load the tensor now
     auto *VecTy = FixedVectorType::get(EltType, TI->getTensorAllocSize(MatMul));
     auto *MallocPtr = TI->getMemPtrFor(MatMul);
@@ -1567,41 +1941,7 @@ public:
         MallocPtr, PointerType::get(VecTy, AS), "malloc.cast", MatMul);
     auto *Output =
         new LoadInst(VecTy, CastMallocPtr, "final.load", false, {}, MatMul);
-
     return Output;
-  }
-
-  Constant *getConstantValue(LLVMContext &Ctx, Type *Ty, int64_t Val) {
-    switch (Ty->getTypeID()) {
-    case Type::IntegerTyID:
-      return ConstantInt::get(Type::getInt32Ty(Ctx), (int)Val);
-    case Type::FloatTyID:
-      return ConstantFP::get(Type::getFloatTy(Ctx), (float)Val);
-    case Type::DoubleTyID:
-      return ConstantFP::get(Type::getDoubleTy(Ctx), (double)Val);
-    case Type::HalfTyID:
-    case Type::BFloatTyID:
-    default:
-      assert(false && "Invalid element type.");
-    }
-    return nullptr;
-  }
-
-  Value *convertToFloat(Value *V, Instruction *InsertBefore) {
-    switch (V->getType()->getTypeID()) {
-    case Type::IntegerTyID:
-      return new SIToFPInst(
-          V, Type::getFloatTy(InsertBefore->getParent()->getContext()), "",
-          InsertBefore);
-    case Type::FloatTyID:
-    case Type::DoubleTyID:
-      return V;
-    case Type::HalfTyID:
-    case Type::BFloatTyID:
-    default:
-      assert(false && "Invalid element type.");
-    }
-    return nullptr;
   }
 
   Value *insertIntrinsicOperation(Intrinsic::ID ID, Value *Operand, Type *Ty, 
@@ -1632,7 +1972,7 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
 
         // Extract the element
         auto *Elem = ExtractElementInst::Create(Input, Offset, "extract.elem", InsertBefore);
-        auto *CastElem = convertToFloat(Elem, InsertBefore);
+        auto *CastElem = ConvertToFloat(Elem, InsertBefore);
 
         // Compute the sine
         auto *Op = insertIntrinsicOperation(ID, CastElem, 
@@ -1675,7 +2015,7 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
       ElementWiseInfo &EwInfo, Value *Input, Type *ElemTy,
       Instruction *InsertBefore) {
     auto &Ctx = InsertBefore->getParent()->getContext();
-    auto *Zero = getConstantValue(Ctx, ElemTy, 0);
+    auto *Zero = GetConstantValue(Ctx, ElemTy, 0);
 
     // Get the index into the tensor
     auto *Offset = computeIndex(
@@ -1770,17 +2110,17 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
       // Extract the element
       auto *Elem = ExtractElementInst::Create(
           Input, Offset, "extract.elem", InsertBefore);
-      auto *CastElem = convertToFloat(Elem, InsertBefore);
+      auto *CastElem = ConvertToFloat(Elem, InsertBefore);
 
       // Compute the exponent
-      auto *Two = getConstantValue(Ctx, CastElem->getType(), 2);
+      auto *Two = GetConstantValue(Ctx, CastElem->getType(), 2);
       auto *Exponent = BinaryOperator::Create(
           Instruction::FMul, Two, Elem, "exponent", InsertBefore);
       auto *Exp = insertIntrinsicOperation(Intrinsic::exp, Exponent, 
                         Exponent->getType(), "exp", InsertBefore);
 
       // Compute Tanh
-      auto *One = getConstantValue(Ctx, Exp->getType(), 1);
+      auto *One = GetConstantValue(Ctx, Exp->getType(), 1);
       auto *Diff =
           BinaryOperator::Create(Instruction::FSub, Exp, One, "", InsertBefore);
       auto *Sum =
@@ -1841,14 +2181,14 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
       // Extract the element
       auto *Elem = ExtractElementInst::Create(
           Input, Offset, "extract.elem", InsertBefore);
-      auto *Exponent = convertToFloat(Elem, InsertBefore);
+      auto *Exponent = ConvertToFloat(Elem, InsertBefore);
 
       // Compute the exponent
       auto *Exp = insertIntrinsicOperation(Intrinsic::exp, Exponent, 
                             Exponent->getType(), "exp", InsertBefore);
 
       // Compute Tanh
-      auto *One = getConstantValue(Ctx, Exp->getType(), 1);
+      auto *One = GetConstantValue(Ctx, Exp->getType(), 1);
       auto *Sum =
           BinaryOperator::Create(Instruction::FAdd, Exp, One, "", InsertBefore);
       auto *Tanh = BinaryOperator::Create(
@@ -1916,7 +2256,7 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
           Value *BroadcastVal, unsigned NumElems, Instruction *InsertBefore) {
     // Since no input is given, create a poison vector
     auto *Input = PoisonValue::get(FixedVectorType::get(BroadcastVal->getType(), NumElems));
-    createBroadCastIntrinsic(Input, BroadcastVal, NumElems, InsertBefore);
+    return createBroadCastIntrinsic(Input, BroadcastVal, NumElems, InsertBefore);
   }
 
   Value *generateBroadcastKernel(Value *Input,
@@ -1957,8 +2297,8 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
         auto *V = ExtractElementInst::Create(
             TTInfo.InTileVector[I], ConstantInt::get(I32Ty, J),
             "transpose.extract", InsertBefore);
-        TTInfo.OutTileVector[J] = InsertElementInst::Create(
-            TTInfo.OutTileVector[J], V, ConstantInt::get(I32Ty, I),
+        TTInfo.OutTiles[J] = InsertElementInst::Create(
+            TTInfo.OutTiles[J], V, ConstantInt::get(I32Ty, I),
             "transpose.insert", InsertBefore);
       }
     }
@@ -2060,7 +2400,9 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
 
     return Output;
   }
+
 };
+
 
 static std::vector<size_t> divisorsSmallerThan(size_t n, size_t kmax) {
   size_t nsqrt = size_t(std::sqrt(n));
@@ -2373,3 +2715,4 @@ INITIALIZE_PASS_END(
 FunctionPass *llvm::createLowerTensorIntrinsicsPass() {
   return new LowerTensorIntrinsicsLegacyPass();
 }
+
