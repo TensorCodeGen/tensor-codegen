@@ -71,6 +71,13 @@ bool TensorInfo::isTensorInstruction(Instruction *I) {
             case Intrinsic::tensor_matmul:
             case Intrinsic::tensor_broadcast:
             case Intrinsic::tensor_transpose:
+            case Intrinsic::tensor_reduce_max:
+            case Intrinsic::tensor_reduce_min:
+            case Intrinsic::tensor_reduce_and:
+            case Intrinsic::tensor_reduce_or:
+            case Intrinsic::tensor_reduce_xor:
+            case Intrinsic::tensor_reduce_add:
+            case Intrinsic::tensor_reduce_mul:
                 return true;
             default:
                 return false;
@@ -240,6 +247,41 @@ TensorType TensorInfo::getTransposeOuputProperties(LLVMContext &Ctx, TensorType 
     return TensorType(Shape, Layout, Padding);
 }
 
+TensorType TensorInfo::getReduceOutputProperties(LLVMContext &Ctx, TensorType &Input, 
+          SmallVector<unsigned, 4> &WindowShape, SmallVector<unsigned, 4> &WindowStrides) {
+    // Get the shape of the output tensor of reduction
+    auto *Int32Ty = Type::getInt32Ty(Ctx);
+    unsigned NumInDims = Input.getNumDimensions();
+    std::vector<Constant *> ShapeVec;
+    std::vector<Constant *> LayoutVec;
+    std::vector<Constant *> PaddingVec;
+    for(unsigned i = 0; i < (NumInDims - 2); i++) {
+        unsigned DimVal = Input.getShapeDimensionVal(i);
+        ShapeVec.push_back(ConstantInt::get(Int32Ty, DimVal));
+        LayoutVec.push_back(ConstantInt::get(Int32Ty, i));
+        PaddingVec.push_back(ConstantInt::get(Int32Ty, 0));
+    }
+    unsigned NumWinDims = WindowShape.size();
+    unsigned OutputSize = ((WindowShape[NumWinDims - 2] 
+                - Input.getShapeDimensionVal(NumInDims - 2)) / WindowStrides[NumWinDims - 2]) + 1;
+    ShapeVec.push_back(ConstantInt::get(Int32Ty, OutputSize));
+    LayoutVec.push_back(ConstantInt::get(Int32Ty, NumInDims - 2));
+    PaddingVec.push_back(ConstantInt::get(Int32Ty, 0));
+
+    OutputSize = ((WindowShape[NumWinDims - 1] 
+                - Input.getShapeDimensionVal(NumInDims - 2)) / WindowStrides[NumWinDims - 1]) + 1;
+    ShapeVec.push_back(ConstantInt::get(Int32Ty, OutputSize));
+    LayoutVec.push_back(ConstantInt::get(Int32Ty, NumInDims - 1));
+    PaddingVec.push_back(ConstantInt::get(Int32Ty, 0));
+
+    // Construct the tensor type info
+    Value *Shape = ConstantVector::get(ArrayRef<Constant *>(ShapeVec));
+    Value *Layout = ConstantVector::get(ArrayRef<Constant *>(LayoutVec));
+    Value *Padding = ConstantVector::get(ArrayRef<Constant *>(PaddingVec));
+
+    return TensorType(Shape, Layout, Padding);
+}
+
 bool TensorInfo::mapTensorValToProperty(Instruction *I, 
                                    SmallSet<Instruction *, 4> &TensorWaitlist) {
   errs() << "MAP TENSOR VAL TO PROPERTY\n";
@@ -370,6 +412,60 @@ bool TensorInfo::mapTensorValToProperty(Instruction *I,
       // Add the output tensor's properties
       ValToPropertyMap[II] = getTransposeOuputProperties(II->getModule()->getContext(), 
                                             ValToPropertyMap[II->getArgOperand(0)]);
+
+      // If this call is in the tensor wait list, this is good time to remove it!
+      TensorWaitlist.erase(II);
+
+      return true;
+    }
+
+    if(II->getIntrinsicID() == Intrinsic::tensor_reduce_max
+    || II->getIntrinsicID() == Intrinsic::tensor_reduce_min
+    || II->getIntrinsicID() == Intrinsic::tensor_reduce_and
+    || II->getIntrinsicID() == Intrinsic::tensor_reduce_or
+    || II->getIntrinsicID() == Intrinsic::tensor_reduce_xor
+    || II->getIntrinsicID() == Intrinsic::tensor_reduce_add
+    || II->getIntrinsicID() == Intrinsic::tensor_reduce_mul) {
+      // If the input tensor value's propeties have not been resolved yet,
+      // we will resolve them later.
+      const auto &It = ValToPropertyMap.find(II->getArgOperand(2));
+      if(It == ValToPropertyMap.end()) {
+        // The input tensor value must be in the wait list.
+        //assert(TensorWaitlist.find(CI->getArgOperand(0)) != TensorWaitlist.end()
+        //    && "Tensor with unresolved properties must be in thje wait list.");
+        auto *CallArgInst = dyn_cast<Instruction>(II->getArgOperand(2));
+        TensorWaitlist.insert(CallArgInst);
+
+        // Try to find the input tensor value's properties now.
+        if(!mapTensorValToProperty(CallArgInst, TensorWaitlist)) {
+          // Since we still could not resolve the properties, put this call in the wait list
+          TensorWaitlist.insert(II);
+          return false;
+        }
+      }
+
+      // Get the strides and window shape
+      SmallVector<unsigned, 4> WinShape;
+      auto *WinShapeVal = II->getArgOperand(0);
+      auto *ShapeVectorTy = dyn_cast<FixedVectorType>(WinShapeVal->getType());
+      auto *ShapeCV = dyn_cast<ConstantDataVector>(WinShapeVal);
+      for(unsigned I = 0; I < ShapeVectorTy->getNumElements(); I++) {
+          auto *C = ShapeCV->getAggregateElement(I);
+          WinShape.push_back(dyn_cast<ConstantInt>(C)->getZExtValue());
+      }
+      SmallVector<unsigned, 4> Strides;
+      auto *StridesVal = II->getArgOperand(1);
+      auto *StrideVectorTy = dyn_cast<FixedVectorType>(StridesVal->getType());
+      auto *StrideCV = dyn_cast<ConstantDataVector>(StridesVal);
+      for(unsigned I = 0; I < StrideVectorTy->getNumElements(); I++) {
+          auto *C = StrideCV->getAggregateElement(I);
+          Strides.push_back(dyn_cast<ConstantInt>(C)->getZExtValue());
+      }
+
+      // Add the output tensor's properties
+      ValToPropertyMap[II] = getReduceOutputProperties(II->getModule()->getContext(), 
+                                            ValToPropertyMap[II->getArgOperand(2)],
+                                            WinShape, Strides);
 
       // If this call is in the tensor wait list, this is good time to remove it!
       TensorWaitlist.erase(II);
@@ -509,3 +605,4 @@ TensorInfoWrapperPass::TensorInfoWrapperPass() : FunctionPass(ID) {
 
  INITIALIZE_PASS(TensorInfoWrapperPass, "tensor-analysis", "Pass to inferring tensor properties",
                        true, true)
+

@@ -59,6 +59,9 @@ private:
 
   TensorType getTransposeOuputProperties(LLVMContext &Ctx, TensorType &Input);
 
+  TensorType getReduceOutputProperties(LLVMContext &Ctx, TensorType &Input,
+          SmallVector<unsigned, 4> &WindowShape, SmallVector<unsigned, 4> &WindowStrides);
+
 public:
   TensorInfo() = default;
 
