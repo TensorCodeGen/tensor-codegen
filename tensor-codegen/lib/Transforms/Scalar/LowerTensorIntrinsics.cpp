@@ -1092,9 +1092,9 @@ public:
         Value *WinStrides, SmallVector<unsigned, 4> &OutputLayout)
         : InputTensor(InTensor) {
       
-      assert(dyn_cast<ConstantDataVector>(Window) 
+      assert(dyn_cast<ConstantDataVector>(WinShape) 
           && "Window for reduction must be a constant vector.");
-      assert(dyn_cast<ConstantDataVector>(Strides) 
+      assert(dyn_cast<ConstantDataVector>(WinStrides) 
           && "Strides for reduction must be a constant vector.");
       
       // Get the window shape and strides
@@ -1399,7 +1399,7 @@ public:
     
     SmallVector<unsigned, 4> &Shape = Tensor.getShapeVector();
     unsigned NumDims = Shape.size();
-    assert(WinInductionVars.size() == Strides.size() &&
+    assert(WinInductionVars.size() == WinStrides.size() &&
         "The number strides provided must be same as number of window dimensions.");
 
     // Multiply the induction variables with the strides

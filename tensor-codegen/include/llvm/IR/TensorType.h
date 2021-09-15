@@ -99,8 +99,8 @@ public:
         std::vector<Constant *> ConstPaddingVec;
         for(unsigned I = 0; I < NumDims; I++) {
             ConstShapeVec.push_back(ConstantInt::get(Int32Ty, ShapeVect[I]));
-            ConstLayoutVec.push_back(ConstantInt::get(Int32Ty, ShapeVect[I]));
-            ConstPaddingVec.push_back(ConstantInt::get(Int32Ty, ShapeVect[I]));
+            ConstLayoutVec.push_back(ConstantInt::get(Int32Ty, LayoutVect[I]));
+            ConstPaddingVec.push_back(ConstantInt::get(Int32Ty, PaddingVect[I]));
         }
 
         // Initilaize the LLVM values
@@ -138,6 +138,14 @@ public:
     SmallVector<unsigned, 4> &getLayoutVector() { return LayoutVector; }
     SmallVector<unsigned, 4> &getPaddingVector() { return PaddingVector; }
 
+    std::vector<Value *> getTensorPropertiesValueVector() {
+      return std::vector {Shape, Layout, Padding};
+    }
+
+    std::vector<Type *> getTensorPropertiesTypeVector() {
+      return std::vector {Shape->getType(), Layout->getType(), Padding->getType()};
+    }
+    
     unsigned getNumDimensions() {
         auto *ShapeFVTy = dyn_cast<FixedVectorType>(Shape->getType());
         return ShapeFVTy->getNumElements();
@@ -207,5 +215,3 @@ public:
 }   // end of namespace llvm
 
 #endif //LLVM_IR_TENSORTYPE_H
-
-
