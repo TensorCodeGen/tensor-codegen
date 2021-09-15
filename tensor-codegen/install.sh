@@ -10,6 +10,30 @@ CLANG_SRC=$CURRENT_DIR/../clang
 TENSOR_DIR=$LLVM_SRC/lib/Transforms/Tensor
 PATCHES_DIR=llvm_patches
 
+
+# Install options
+NUM_THREADS=2
+NUM_THREADS_INPUT=2
+
+
+TARGET=all
+TARGET_INPUT=all
+
+
+echo "#############################################################################"
+read -p "Number of threads: " NUM_THREADS_INPUT
+
+if [[ $NUM_THREADS_INPUT == "" ]]; then
+  echo "No input given. Using default: $NUM_THREADS"
+elif ! [[ $NUM_THREADS_INPUT =~ ^[0-9]+$ ]]; then
+  echo "Given input is not an integer. Using default: $NUM_THREADS"
+elif [ ! $NUM_THREADS_INPUT -gt 0 ]; then
+  echo "Given input is not greater than 0. Using default: $NUM_THREADS"
+else
+  NUM_THREADS=$NUM_THREADS_INPUT
+fi
+
+
 if [ ! -d $LLVM_SRC/tools/clang ]; then
     echo "#############################################################################"
     echo "Copying clang over to llvm dir"
@@ -29,7 +53,6 @@ if [ ! -d $TENSOR_DIR ]; then
     ln -s $CURRENT_DIR/include/llvm/Analysis/TensorProperties.h $LLVM_SRC/include/llvm/Analysis/TensorProperties.h
     ln -s $CURRENT_DIR/include/llvm/IR/TensorType.h $LLVM_SRC/include/llvm/IR/TensorType.h
     ln -s $CURRENT_DIR/include/llvm/Transforms/Scalar/LowerTensorIntrinsics.h $LLVM_SRC/include/llvm/Transforms/Scalar/LowerTensorIntrinsics.h
-    ln -s $CURRENT_DIR/include/llvm/Transforms/Utils/TensorUtils.h $LLVM_SRC/include/llvm/Transforms/Utils/TensorUtils.h
     echo "#############################################################################"
 else
     echo "#############################################################################"
@@ -38,53 +61,9 @@ else
 fi
 
 
-# cp $CURRENT_DIR/lib/Transforms/Tensor/* $TENSOR_DIR
-#ln -s $CURRENT_DIR/lib/Transforms/Tensor/Tensor.cpp $TENSOR_DIR/Tensor.cpp
-#ln -s $CURRENT_DIR/lib/Transforms/Tensor/CMakeLists.txt $TENSOR_DIR/CMakeLists.txt
-#ln -s $CURRENT_DIR/lib/Transforms/Tensor/Tensor.exports $TENSOR_DIR/Tensor.exports
-
-#cp $CURRENT_DIR/lib/Analysis/* $LLVM_SRC/lib/Analysis/
-
-# Copy Scalar Transformation files
-# cp $CURRENT_DIR/lib/Transforms/Scalar/LowerTensorIntrinsics.cpp $LLVM_SRC/lib/Transforms/Scalar/LowerTensorIntrinsics.cpp
-#ln -s $CURRENT_DIR/lib/Transforms/Scalar/LowerTensorIntrinsics.cpp $LLVM_SRC/lib/Transforms/Scalar/LowerTensorIntrinsics.cpp
-
-## Begin copying include headers
-# cp $CURRENT_DIR/include/llvm/Analysis/TensorProperties.h $LLVM_SRC/include/llvm/Analysis/TensorProperties.h
-#ln -s $CURRENT_DIR/include/llvm/Analysis/TensorProperties.h $LLVM_SRC/include/llvm/Analysis/TensorProperties.h
-
-
-# cp $CURRENT_DIR/include/llvm/IR/TensorType.h $LLVM_SRC/include/llvm/IR/TensorType.h
-#ln -s $CURRENT_DIR/include/llvm/IR/TensorType.h $LLVM_SRC/include/llvm/IR/TensorType.h
-
-# cp $CURRENT_DIR/include/llvm/Transforms/Scalar/LowerTensorIntrinsics.h $LLVM_SRC/include/llvm/Transforms/Scalar/LowerTensorIntrinsics.h
-#ln -s $CURRENT_DIR/include/llvm/Transforms/Scalar/LowerTensorIntrinsics.h $LLVM_SRC/include/llvm/Transforms/Scalar/LowerTensorIntrinsics.h
-
-# cp $CURRENT_DIR/include/llvm/Transforms/Utils/TensorUtils.h $LLVM_SRC/include/llvm/Transforms/Utils/TensorUtils.h
-#ln -s $CURRENT_DIR/include/llvm/Transforms/Utils/TensorUtils.h $LLVM_SRC/include/llvm/Transforms/Utils/TensorUtils.h
-
-
 # Install options
 NUM_THREADS=2
 NUM_THREADS_INPUT=2
-
-
-TARGET=all
-TARGET_INPUT=all
-
-
-echo
-read -p "Number of threads: " NUM_THREADS_INPUT
-
-if [[ $NUM_THREADS_INPUT == "" ]]; then
-  echo "No input given. Using default: $NUM_THREADS"
-elif ! [[ $NUM_THREADS_INPUT =~ ^[0-9]+$ ]]; then
-  echo "Given input is not an integer. Using default: $NUM_THREADS"
-elif [ ! $NUM_THREADS_INPUT -gt 0 ]; then
-  echo "Given input is not greater than 0. Using default: $NUM_THREADS"
-else
-  NUM_THREADS=$NUM_THREADS_INPUT
-fi
 
 
 
@@ -92,7 +71,7 @@ echo
 echo
 echo "Supports the following options: AArch64, AMDGPU, ARM, BPF, Hexagon, Mips, MSP430, NVPTX, PowerPC, Sparc, SystemZ, X86, XCore."
 echo "If building for multiple targets, seperate options with semicolon:"
-echo "e.g. X86;ARM"
+echo "e.g. X86;Hexagon;PowerPC"
 read -p "Build target: " TARGET_INPUT
 if [[ $TARGET_INPUT == "" ]]; then
   echo "No input given. Using default: $TARGET"
@@ -131,8 +110,8 @@ if [ ! -d $INSTALL_DIR ]; then
 fi
 
 cd $BUILD_DIR
-echo cmake $LLVM_SRC -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DLLVM_TARGETS_TO_BUILD=\"$TARGET\"  -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR
-cmake $LLVM_SRC -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DLLVM_TARGETS_TO_BUILD="$TARGET"  -DCMAKE_INSTALL_PREFIX=$INSTALL_DIR
+echo cmake $LLVM_SRC -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DLLVM_TARGETS_TO_BUILD=\"$TARGET\"  -DCMAKE_BUILD_TYPE=\"Release\"
+cmake $LLVM_SRC -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF -DLLVM_TARGETS_TO_BUILD="$TARGET" -DCMAKE_BUILD_TYPE="Release"
 echo "Generated build files"
 
 echo make -j$NUM_THREADS
