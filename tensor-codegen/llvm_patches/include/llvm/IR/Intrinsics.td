@@ -1704,6 +1704,34 @@ def int_tensor_broadcast : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, LLVMVe
 def int_tensor_transpose : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty],
                                         [IntrNoMem, IntrSpeculatable]>;
 
+def int_tensor_reduce_max : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_anyvector_ty,
+                                        llvm_anyvector_ty],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
+def int_tensor_reduce_min : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_anyvector_ty,
+                                        llvm_anyvector_ty],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
+def int_tensor_reduce_add : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_anyvector_ty,
+                                        llvm_anyvector_ty],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
+def int_tensor_reduce_mul : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_anyvector_ty,
+                                        llvm_anyvector_ty],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
+def int_tensor_reduce_and : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_anyvector_ty,
+                                        llvm_anyvector_ty],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
+def int_tensor_reduce_or : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_anyvector_ty,
+                                        llvm_anyvector_ty],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
+def int_tensor_reduce_xor : Intrinsic<[llvm_anyvector_ty], [llvm_token_ty, llvm_anyvector_ty,
+                                        llvm_anyvector_ty],
+                                        [IntrNoMem, IntrSpeculatable]>;
+
 
 //===---------- Intrinsics to represent tensor memory operations -----------------===//
 
