@@ -2882,9 +2882,9 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
       Intrinsic::ID VectorID, Intrinsic::ID ScalarID, 
       unsigned TileSize_M, unsigned TileSize_N, unsigned InnerLoopUnrollFactor) {
     // Get the input and output tensors
-    auto *Input = TI->getTensorOperand(Reduce, 2);
-    auto *Window = Reduce->getOperand(0);
-    auto *Strides = Reduce->getOperand(1);
+    auto *Input = TI->getTensorOperand(Reduce, 0);
+    auto *Window = Reduce->getOperand(1);
+    auto *Strides = Reduce->getOperand(2);
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     TensorType &OutputTensor = TI->getTensorTypeInfoFor(Reduce);
     auto *EltType =
@@ -2947,9 +2947,9 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
       Intrinsic::ID VectorID, Instruction::BinaryOps ScalarOpcode, 
       unsigned TileSize_M, unsigned TileSize_N, unsigned InnerLoopUnrollFactor) {
     // Get the input and output tensors
-    auto *Input = TI->getTensorOperand(Reduce, 2);
-    auto *Window = Reduce->getOperand(0);
-    auto *Strides = Reduce->getOperand(1);
+    auto *Input = TI->getTensorOperand(Reduce, 0);
+    auto *Window = Reduce->getOperand(1);
+    auto *Strides = Reduce->getOperand(2);
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     TensorType &OutputTensor = TI->getTensorTypeInfoFor(Reduce);
     auto *EltType =

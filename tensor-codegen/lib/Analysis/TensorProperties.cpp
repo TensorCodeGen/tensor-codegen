@@ -428,12 +428,12 @@ bool TensorInfo::mapTensorValToProperty(Instruction *I,
     || II->getIntrinsicID() == Intrinsic::tensor_reduce_mul) {
       // If the input tensor value's propeties have not been resolved yet,
       // we will resolve them later.
-      const auto &It = ValToPropertyMap.find(II->getArgOperand(2));
+      const auto &It = ValToPropertyMap.find(II->getArgOperand(0));
       if(It == ValToPropertyMap.end()) {
         // The input tensor value must be in the wait list.
         //assert(TensorWaitlist.find(CI->getArgOperand(0)) != TensorWaitlist.end()
         //    && "Tensor with unresolved properties must be in thje wait list.");
-        auto *CallArgInst = dyn_cast<Instruction>(II->getArgOperand(2));
+        auto *CallArgInst = dyn_cast<Instruction>(II->getArgOperand(0));
         TensorWaitlist.insert(CallArgInst);
 
         // Try to find the input tensor value's properties now.
@@ -446,7 +446,7 @@ bool TensorInfo::mapTensorValToProperty(Instruction *I,
 
       // Get the strides and window shape
       SmallVector<unsigned, 4> WinShape;
-      auto *WinShapeVal = II->getArgOperand(0);
+      auto *WinShapeVal = II->getArgOperand(1);
       auto *ShapeVectorTy = dyn_cast<FixedVectorType>(WinShapeVal->getType());
       auto *ShapeCV = dyn_cast<ConstantDataVector>(WinShapeVal);
       for(unsigned I = 0; I < ShapeVectorTy->getNumElements(); I++) {
@@ -454,7 +454,7 @@ bool TensorInfo::mapTensorValToProperty(Instruction *I,
           WinShape.push_back(dyn_cast<ConstantInt>(C)->getZExtValue());
       }
       SmallVector<unsigned, 4> Strides;
-      auto *StridesVal = II->getArgOperand(1);
+      auto *StridesVal = II->getArgOperand(2);
       auto *StrideVectorTy = dyn_cast<FixedVectorType>(StridesVal->getType());
       auto *StrideCV = dyn_cast<ConstantDataVector>(StridesVal);
       for(unsigned I = 0; I < StrideVectorTy->getNumElements(); I++) {
@@ -464,7 +464,7 @@ bool TensorInfo::mapTensorValToProperty(Instruction *I,
 
       // Add the output tensor's properties
       ValToPropertyMap[II] = getReduceOutputProperties(II->getModule()->getContext(), 
-                                            ValToPropertyMap[II->getArgOperand(2)],
+                                            ValToPropertyMap[II->getArgOperand(0)],
                                             WinShape, Strides);
 
       // If this call is in the tensor wait list, this is good time to remove it!

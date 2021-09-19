@@ -167,56 +167,63 @@ static Function *getIntrinsicDeclaration(CallInst *CI, std::vector<Type *> &Args
      assert(dyn_cast<CallInst>(TypeInfoIntrinsic) && "Tensor ops' operands must come from typeinfo");
      return Intrinsic::getDeclaration(M, Intrinsic::tensor_reduce_max,
               ArrayRef<Type*>({CI->getCalledFunction()->getReturnType(),
-                              CI->getOperand(0)->getType(),
-                              CI->getOperand(1)->getType()}));
+                              //CI->getOperand(0)->getType(),
+                              CI->getOperand(1)->getType(),
+			      CI->getOperand(2)->getType()}));
    }
    if(CalledFuncName.contains(StringRef("tensor_reduce_min"))) {
      auto *TypeInfoIntrinsic = FakeTypeToTokenTypeVal[CI->getArgOperand(0)];
      assert(dyn_cast<CallInst>(TypeInfoIntrinsic) && "Tensor ops' operands must come from typeinfo");
      return Intrinsic::getDeclaration(M, Intrinsic::tensor_reduce_min,
               ArrayRef<Type*>({CI->getCalledFunction()->getReturnType(),
-                              CI->getOperand(0)->getType(),
-                              CI->getOperand(1)->getType()}));
+                              //CI->getOperand(0)->getType(),
+                              CI->getOperand(1)->getType(),
+			      CI->getOperand(2)->getType()}));
    }
    if(CalledFuncName.contains(StringRef("tensor_reduce_and"))) {
      auto *TypeInfoIntrinsic = FakeTypeToTokenTypeVal[CI->getArgOperand(0)];
      assert(dyn_cast<CallInst>(TypeInfoIntrinsic) && "Tensor ops' operands must come from typeinfo");
      return Intrinsic::getDeclaration(M, Intrinsic::tensor_reduce_and,
               ArrayRef<Type*>({CI->getCalledFunction()->getReturnType(),
-                              CI->getOperand(0)->getType(),
-                              CI->getOperand(1)->getType()}));
+                              //CI->getOperand(0)->getType(),
+                              CI->getOperand(1)->getType(),
+			      CI->getOperand(2)->getType()}));
    }
   if(CalledFuncName.contains(StringRef("tensor_reduce_or"))) {
     auto *TypeInfoIntrinsic = FakeTypeToTokenTypeVal[CI->getArgOperand(0)];
     assert(dyn_cast<CallInst>(TypeInfoIntrinsic) && "Tensor ops' operands must come from typeinfo");
     return Intrinsic::getDeclaration(M, Intrinsic::tensor_reduce_or,
             ArrayRef<Type*>({CI->getCalledFunction()->getReturnType(),
-                            CI->getOperand(0)->getType(),
-                            CI->getOperand(1)->getType()}));
+                            //CI->getOperand(0)->getType(),
+                            CI->getOperand(1)->getType(),
+			    CI->getOperand(2)->getType()}));
   }
   if(CalledFuncName.contains(StringRef("tensor_reduce_xor"))) {
     auto *TypeInfoIntrinsic = FakeTypeToTokenTypeVal[CI->getArgOperand(0)];
     assert(dyn_cast<CallInst>(TypeInfoIntrinsic) && "Tensor ops' operands must come from typeinfo");
     return Intrinsic::getDeclaration(M, Intrinsic::tensor_reduce_xor,
             ArrayRef<Type*>({CI->getCalledFunction()->getReturnType(),
-                            CI->getOperand(0)->getType(),
-                            CI->getOperand(1)->getType()}));
+                            //CI->getOperand(0)->getType(),
+                            CI->getOperand(1)->getType(),
+			    CI->getOperand(2)->getType()}));
   }
   if(CalledFuncName.contains(StringRef("tensor_reduce_add"))) {
     auto *TypeInfoIntrinsic = FakeTypeToTokenTypeVal[CI->getArgOperand(0)];
     assert(dyn_cast<CallInst>(TypeInfoIntrinsic) && "Tensor ops' operands must come from typeinfo");
     return Intrinsic::getDeclaration(M, Intrinsic::tensor_reduce_add,
             ArrayRef<Type*>({CI->getCalledFunction()->getReturnType(),
-                            CI->getOperand(0)->getType(),
-                            CI->getOperand(1)->getType()}));
+                            //CI->getOperand(0)->getType(),
+                            CI->getOperand(1)->getType(),
+			    CI->getOperand(2)->getType()}));
   }
   if(CalledFuncName.contains(StringRef("tensor_reduce_mul"))) {
     auto *TypeInfoIntrinsic = FakeTypeToTokenTypeVal[CI->getArgOperand(0)];
     assert(dyn_cast<CallInst>(TypeInfoIntrinsic) && "Tensor ops' operands must come from typeinfo");
     return Intrinsic::getDeclaration(M, Intrinsic::tensor_reduce_mul,
             ArrayRef<Type*>({CI->getCalledFunction()->getReturnType(),
-                            CI->getOperand(0)->getType(),
-                            CI->getOperand(1)->getType()}));
+                            //CI->getOperand(0)->getType(),
+                            CI->getOperand(1)->getType(),
+			    CI->getOperand(2)->getType()}));
   }
 
   // Transpose
@@ -781,14 +788,14 @@ static bool mapTensorValToProperty(Instruction *I,
     || CalledFuncName.contains(StringRef("tensor_reduce_mul"))) {
       // If the input tensor value's propeties have not been resolved yet,
       // we will resolve them later.
-      const auto &It = ValToPropertyMap.find(CI->getArgOperand(2));
-      errs() << "CALL OPERAND: " << *(CI->getArgOperand(2)) << "\n";
+      const auto &It = ValToPropertyMap.find(CI->getArgOperand(0));
+      errs() << "CALL OPERAND: " << *(CI->getArgOperand(0)) << "\n";
       if(It == ValToPropertyMap.end()) {
         errs() << "CALL OPERAND NOT MAPPED\n";
         // The input tensor value must be in the wait list.
         //assert(TensorWaitlist.find(CI->getArgOperand(0)) != TensorWaitlist.end()
         //    && "Tensor with unresolved properties must be in thje wait list.");
-        auto *CallArgInst = dyn_cast<Instruction>(CI->getArgOperand(2));
+        auto *CallArgInst = dyn_cast<Instruction>(CI->getArgOperand(0));
         TensorWaitlist.insert(CallArgInst);
 
         // Try to find the input tensor value's properties now.
@@ -803,7 +810,7 @@ static bool mapTensorValToProperty(Instruction *I,
 
       // Get the strides and window shape
       SmallVector<unsigned, 4> WinShape;
-      auto *WinShapeVal = CI->getArgOperand(0);
+      auto *WinShapeVal = CI->getArgOperand(1);
       auto *ShapeVectorTy = dyn_cast<FixedVectorType>(WinShapeVal->getType());
       auto *ShapeCV = dyn_cast<ConstantDataVector>(WinShapeVal);
       for(unsigned I = 0; I < ShapeVectorTy->getNumElements(); I++) {
@@ -811,7 +818,7 @@ static bool mapTensorValToProperty(Instruction *I,
           WinShape.push_back(dyn_cast<ConstantInt>(C)->getZExtValue());
       }
       SmallVector<unsigned, 4> Strides;
-      auto *StridesVal = CI->getArgOperand(1);
+      auto *StridesVal = CI->getArgOperand(2);
       auto *StrideVectorTy = dyn_cast<FixedVectorType>(StridesVal->getType());
       auto *StrideCV = dyn_cast<ConstantDataVector>(StridesVal);
       for(unsigned I = 0; I < StrideVectorTy->getNumElements(); I++) {
@@ -821,7 +828,7 @@ static bool mapTensorValToProperty(Instruction *I,
 
       // Add the output tensor's properties
       ValToPropertyMap[CI] = getReduceOutputProperties(CI->getModule()->getContext(), 
-                                                  ValToPropertyMap[CI->getArgOperand(2)],
+                                                  ValToPropertyMap[CI->getArgOperand(0)],
                                                   WinShape, Strides);
       
       // If this call is in the tensor wait list, this is good time to remove it!
