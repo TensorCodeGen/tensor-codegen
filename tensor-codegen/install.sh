@@ -33,6 +33,18 @@ else
   NUM_THREADS=$NUM_THREADS_INPUT
 fi
 
+echo
+echo
+echo "Supports the following options: AArch64, AMDGPU, ARM, BPF, Hexagon, Mips, MSP430, NVPTX, PowerPC, Sparc, SystemZ, X86, XCore."
+echo "If building for multiple targets, seperate options with semicolon:"
+echo "e.g. X86;Hexagon;PowerPC"
+read -p "Build target: " TARGET_INPUT
+if [[ $TARGET_INPUT == "" ]]; then
+  echo "No input given. Using default: $TARGET"
+else
+  TARGET=$TARGET_INPUT
+fi
+echo
 
 if [ ! -d $LLVM_SRC/tools/clang ]; then
     echo "#############################################################################"
@@ -61,33 +73,13 @@ else
 fi
 
 
-# Install options
-NUM_THREADS=2
-NUM_THREADS_INPUT=2
-
-
-
-echo
-echo
-echo "Supports the following options: AArch64, AMDGPU, ARM, BPF, Hexagon, Mips, MSP430, NVPTX, PowerPC, Sparc, SystemZ, X86, XCore."
-echo "If building for multiple targets, seperate options with semicolon:"
-echo "e.g. X86;Hexagon;PowerPC"
-read -p "Build target: " TARGET_INPUT
-if [[ $TARGET_INPUT == "" ]]; then
-  echo "No input given. Using default: $TARGET"
-else
-  TARGET=$TARGET_INPUT
-fi
-echo
 
 echo "###################################################"
 echo "Running with the following options:"
 echo Threads: $NUM_THREADS
 echo Targets: $TARGET
 echo "###################################################"
-read -p "Press enter to continue"
-
-
+#read -p "Press enter to continue"
 
 
 
