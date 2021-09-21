@@ -33,6 +33,7 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/IR/Verifier.h"
 
 #include "llvm/Analysis/TensorProperties.h"
 #include "llvm/IR/TensorType.h"
@@ -52,8 +53,8 @@ static cl::opt<std::string> ReadKnobsFrom(
                                 "and lower instructions with these values"));
 
 //struct CodeGenKnobs {
-  unsigned TileSize_M = 2;
-  unsigned TileSize_N = 1;
+  unsigned TileSize_M = 4;
+  unsigned TileSize_N = 4;
   unsigned TileSize_K = 10;
 
   unsigned TileSize = 2;
@@ -66,7 +67,7 @@ static cl::opt<std::string> ReadKnobsFrom(
 
   bool LowerToVectorIntrinsics = false;
 
-  bool LowerToTileIntrinsics = false;
+  bool LowerToTileIntrinsics = true;
 //};
 
 struct TiledLoopNestInfo {
@@ -580,7 +581,15 @@ public:
       }
     }
 
-    void insert2DTilePHIs(Type *ElemType) {
+    void completeTilePHIs() {
+      BasicBlock *InnerLoopLatch =
+          LoopNestInfo.LoopLatches[LoopNestInfo.LoopLatches.size() - 1];
+      for (unsigned I = 0; I < OutTiles.size(); I++) {
+        TilePHIs[I]->addIncoming(OutTiles[I], InnerLoopLatch);
+      }
+    }
+
+    void insert2DTilePHIs(Type *ElemType, TensorInfo &TI) {
       unsigned NumHeaders = LoopNestInfo.LoopHeaders.size();
       BasicBlock *InnerLoopHeader = LoopNestInfo.LoopHeaders[NumHeaders - 1];
       unsigned NumPreheaders = LoopNestInfo.LoopPreheaders.size();
@@ -617,15 +626,11 @@ public:
                               "tile.phi.typeinfo." + Twine(I) + "." + Twine(J), 
                               InnerHeaderTerminator);
           Out2DTiles[I].push_back(TypeInfo);
-        }
-      }
-    }
 
-    void completeTilePHIs() {
-      BasicBlock *InnerLoopLatch =
-          LoopNestInfo.LoopLatches[LoopNestInfo.LoopLatches.size() - 1];
-      for (unsigned I = 0; I < OutTiles.size(); I++) {
-        TilePHIs[I]->addIncoming(OutTiles[I], InnerLoopLatch);
+          // Add typeinfo info in tensor info
+          TI.addTensorInfoFor(Tiles2DPHIs[I][J], Out2DTileReg);
+          TI.addTensorInfoFor(TypeInfo, Out2DTileReg);
+        }
       }
     }
     
@@ -1557,6 +1562,9 @@ public:
 
         // Add load instruction to the tensor type to value map
         LoadMap[J / RegNumRows].push_back(TileLoad);
+
+        // Put the load in tensor info
+        TI->addTensorInfoFor(TileLoad, RegTile);
       }
     }
     return Result;
@@ -1594,7 +1602,7 @@ public:
   void store2DTile(
       T &TensorOpInfo, Value *TensorPtr, TensorType &RegTile, 
       Type *EltTy, MaybeAlign MAlign, bool IsVolatile, Instruction *InsertBefore) {
-
+    
     auto &OutTensor = TensorOpInfo.getOutputTensor();
     auto &OutBlock = TensorOpInfo.getOutputTile();
     auto *Int32Ty = Type::getInt32Ty(InsertBefore->getParent()->getContext());
@@ -1627,6 +1635,7 @@ public:
         ArgsTy.insert(ArgsTy.end(), {Type::getTokenTy(InsertBefore->getParent()->getContext())});
         auto *TileStoreFunc = Intrinsic::getDeclaration(InsertBefore->getModule(), 
                         Intrinsic::tensor_store, ArrayRef<Type *>(ArgsTy));
+        errs() << "TILE STORE INTRINSIC: " << *TileStoreFunc << "\n";
         std::vector<Value *> Args = {GEP};
         Args.insert(Args.end(), StridesVector);
         Args.insert(Args.end(), 
@@ -2018,7 +2027,12 @@ public:
                             {OutputTiles[LJ][RI], LTileLoad, RTileLoad}, "tile.mma", InsertBefore);
             std::vector<Value *> Args = {TileMMA};
             Args.insert(Args.end(), OutRegPropertiesValVect.begin(), OutRegPropertiesValVect.end());
-            OutputTiles[LJ][RI] = CallInst::Create(TypeInfoFunc, Args, "tile.mma.typeinfo", InsertBefore);
+            auto *TypeInfoCall = CallInst::Create(TypeInfoFunc, Args, "tile.mma.typeinfo", InsertBefore);
+            OutputTiles[LJ][RI] = TypeInfoCall;
+
+            // Add tensor mma and typeinfo into the tensor info
+            TI->addTensorInfoFor(TileMMA, Out2DTileReg);
+            TI->addTensorInfoFor(TypeInfoCall, Out2DTileReg);
           }
         }
       }
@@ -2231,7 +2245,7 @@ public:
 
     if(LowerToTileIntrinsics) {
       // Insert PHIs that represent the tiles
-      MMInfo.insert2DTilePHIs(EltType);
+      MMInfo.insert2DTilePHIs(EltType, *TI);
 
       errs() << "GENERATED PHIS: " << *(MatMul->getParent()->getParent()) << "\n";
 
@@ -2262,8 +2276,12 @@ public:
           MMInfo, TI->getMemPtrFor(MatMul), MMInfo.Out2DTileReg, EltType, {}, false,
           (MMInfo.getBlockToStoreTile())->getTerminator());
 
+      errs() << "GENERATED MATMUL STORES: \n" << *(InnerBodyTerminator->getParent()->getParent()) << "\n";
+
       // Finish completeling the PHIs for tiles
       MMInfo.complete2DTilePHIs();
+
+      errs() << "GENERATED PHIs: \n" << *(InnerBodyTerminator->getParent()->getParent()) << "\n";
     } else {
       // Insert PHIs that represent the tiles
       MMInfo.insertTilePHIs(EltType);
@@ -3424,10 +3442,20 @@ bool LowerTensorIntrinsicsLegacyPass::runOnFunction(Function &F) {
   }
 
   // Remove the typeinfo intrinsics
-  for (auto *II : ToBeRemoved) {
-    II->replaceAllUsesWith(UndefValue::get(II->getType()));
-    II->eraseFromParent();
+  for (auto *I : ToBeRemoved) {
+    // Remove the tensor info
+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+      if(II->getIntrinsicID() == Intrinsic::tensor_typeinfo) {
+        TI.removeTenorInfoFor(II->getArgOperand(0));
+      }
+    }
+    TI.removeTenorInfoFor(I);
+    I->replaceAllUsesWith(UndefValue::get(I->getType()));
+    I->eraseFromParent();
   }
+
+  bool BrokenDebugInfo = true;
+  assert(verifyModule(BrokenDebugInfo, *(F.getParent()), errs()));
 
   return true;
 }
@@ -3448,4 +3476,5 @@ INITIALIZE_PASS_END(
 FunctionPass *llvm::createLowerTensorIntrinsicsPass() {
   return new LowerTensorIntrinsicsLegacyPass();
 }
+
 
