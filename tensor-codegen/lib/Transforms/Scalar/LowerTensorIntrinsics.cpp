@@ -2406,6 +2406,11 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     auto *ElemTy = dyn_cast<VectorType>(Op->getType())->getElementType();
 
+    // Load the tensor
+    auto *Ptr = TI->getMemPtrFor(Op);
+    Input = loadTensor(Ptr, ElemTy, 
+                    TI->getTensorAllocSize(Input), Op);
+
     // Set up the information fro the elementwise operations.
     auto EwInfo = ElementWiseInfo(InputTensor);
 
@@ -2421,6 +2426,9 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
 
     // Complete the phi ndoe representing the tensor
     EwInfo.completeTensorPHI(Output);
+
+    // Store the tensor back in memory
+    storeTensor(TI->getMemPtrFor(Op), Output, Op);
 
     return Output;
   }
