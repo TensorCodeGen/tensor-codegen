@@ -2286,6 +2286,16 @@ public:
       // Insert PHIs that represent the tiles
       MMInfo.insertTilePHIs(EltType);
 
+      // Load tiles of the operands.
+      MMInfo.LTileVector = loadTile<MatMulInfo>(
+          MMInfo, TI->getMemPtrFor(LTensor), LTensorType, MMInfo.LTile,
+          EltType, MMInfo.LTensorIndices, {}, false,
+          InnerBodyTerminator);
+      MMInfo.RTileVector = loadTile<MatMulInfo>(
+          MMInfo, TI->getMemPtrFor(RTensor), RTensorType, MMInfo.RTile,
+          EltType, MMInfo.RTensorIndices, {}, false,
+          InnerBodyTerminator);
+
       // Generate the matmul kernel
       if(LowerToVectorIntrinsics)
         generateMatrixMultiply1DKernel(MMInfo, EltType, InnerBodyTerminator);
@@ -3476,5 +3486,4 @@ INITIALIZE_PASS_END(
 FunctionPass *llvm::createLowerTensorIntrinsicsPass() {
   return new LowerTensorIntrinsicsLegacyPass();
 }
-
 
