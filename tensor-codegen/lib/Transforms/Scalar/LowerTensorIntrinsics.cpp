@@ -1570,6 +1570,31 @@ public:
     return Result;
   }
 
+  Value *loadTensor(Value *Ptr,  Type *ElemTy, 
+                  unsigned NumElements, Instruction *InsertBefore) {
+     auto *VecTy = FixedVectorType::get(ElemTy, NumElements);
+    if(dyn_cast<PointerType>(Ptr->getType())->getElementType() != VecTy) {
+      unsigned AS = dyn_cast<PointerType>(Ptr->getType())->getAddressSpace();
+      auto *VecPtrType = PointerType::get(
+          FixedVectorType::get(ElemTy, NumElements), AS);
+      Ptr = CastInst::CreatePointerCast(
+          Ptr, VecPtrType, "vec.cast", InsertBefore);
+    }
+    return new LoadInst(VecTy, Ptr, 
+                              "input.load", false, {}, InsertBefore);
+  }
+
+
+  void storeTensor(Value *Ptr,  Value *Tensor, Instruction *InsertBefore) {
+    if(dyn_cast<PointerType>(Ptr->getType())->getElementType() != Tensor->getType()) {
+      unsigned AS = dyn_cast<PointerType>(Ptr->getType())->getAddressSpace();
+      auto *VecPtrType = PointerType::get(Tensor->getType(), AS);
+      Ptr = CastInst::CreatePointerCast(
+          Ptr, VecPtrType, "vec.cast", InsertBefore);
+    }
+    new StoreInst(Tensor, Ptr, false, {}, InsertBefore);
+  }
+
   template <typename T>
   void storeTile(
       T &TensorOpInfo, Value *TensorPtr, Type *EltTy, MaybeAlign MAlign,
@@ -2460,6 +2485,11 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     auto *ElemTy = dyn_cast<VectorType>(Relu->getType())->getElementType();
 
+    // Load the tensor
+    auto *Ptr = TI->getMemPtrFor(Relu);
+    Input = loadTensor(Ptr, ElemTy, 
+                    TI->getTensorAllocSize(Input), Relu);
+
     auto EwInfo = ElementWiseInfo(InputTensor);
 
     // Create the loop nest information
@@ -2474,6 +2504,9 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
 
     // Complete the phi node representing the tensor
     EwInfo.completeTensorPHI(Output);
+
+    // Store the tensor back in memory
+    storeTensor(TI->getMemPtrFor(Relu), Output, Relu);
 
     return Output;
   }
@@ -2530,6 +2563,11 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     auto *ElemTy = dyn_cast<VectorType>(Tanh->getType())->getElementType();
 
+    // Load the tensor
+    auto *Ptr = TI->getMemPtrFor(Tanh);
+    Input = loadTensor(Ptr, ElemTy, 
+                    TI->getTensorAllocSize(Input), Tanh);
+
     // Set up the information fro the elementwise operations.
     auto EwInfo = ElementWiseInfo(InputTensor);
 
@@ -2540,11 +2578,15 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     EwInfo.insertTensorPHI(Input, ElemTy);
 
     auto *InnerBodyTerminator = EwInfo.getInnerLoopBody()->getTerminator();
+
     auto *Output =
         generateScalarTanhKernel(EwInfo, Input, ElemTy, InnerBodyTerminator);
 
     // Complete the phi ndoe representing the tensor
     EwInfo.completeTensorPHI(Output);
+
+    // Store the tensor back in memory
+    storeTensor(TI->getMemPtrFor(Tanh), Output, Tanh);
 
     return Output;
   }
@@ -2596,6 +2638,11 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     auto *ElemTy = dyn_cast<VectorType>(Sigmoid->getType())->getElementType();
 
+    // Load the tensor
+    auto *Ptr = TI->getMemPtrFor(Sigmoid);
+    Input = loadTensor(Ptr, ElemTy, 
+                    TI->getTensorAllocSize(Input), Sigmoid);
+
     // Set up the information fro the elementwise operations.
     auto EwInfo = ElementWiseInfo(InputTensor);
 
@@ -2606,11 +2653,15 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     EwInfo.insertTensorPHI(Input, ElemTy);
 
     auto *InnerBodyTerminator = EwInfo.getInnerLoopBody()->getTerminator();
+
     auto *Output =
         generateScalarSigmoidKernel(EwInfo, Input, ElemTy, InnerBodyTerminator);
 
     // Complete the phi ndoe representing the tensor
     EwInfo.completeTensorPHI(Output);
+
+    // Store the tensor back in memory
+    storeTensor(TI->getMemPtrFor(Sigmoid), Output, Sigmoid);
 
     return Output;
   }
@@ -2669,9 +2720,25 @@ Value *generateElementWiseScalarKernel(Intrinsic::ID ID,
     TensorType &InputTensor = TI->getTensorTypeInfoFor(Input);
     unsigned NumElems = InputTensor.getTensorSize();
     auto *BroadcastVal = Broadcast->getArgOperand(1);
-    if(LowerToVectorIntrinsics)
-      return generateBroadcastKernel(Input, BroadcastVal, NumElems, Broadcast);
-    return generateBroadcastKernel(BroadcastVal, NumElems, Broadcast);
+    if(LowerToVectorIntrinsics) {
+      // Load the tensor
+      auto *ElemTy = dyn_cast<VectorType>(Broadcast->getType())->getElementType();
+      auto *Ptr = TI->getMemPtrFor(Broadcast);
+      Input = loadTensor(Ptr, ElemTy, 
+                      TI->getTensorAllocSize(Input), Broadcast);
+      auto *Output = generateBroadcastKernel(Input, BroadcastVal, NumElems, Broadcast);
+
+      // Store the tensor back in memory
+      storeTensor(TI->getMemPtrFor(Broadcast), Output, Broadcast);
+
+      return Output;
+    }
+    auto *Output = generateBroadcastKernel(BroadcastVal, NumElems, Broadcast);
+
+     // Store the tensor back in memory
+    storeTensor(TI->getMemPtrFor(Broadcast), Output, Broadcast);
+
+    return Output;
   }
 
   /// TODO: make transpose more general
